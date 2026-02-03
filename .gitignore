@@ -1,0 +1,102 @@
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.pid
+.Python
+
+# Common tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+coverage/
+.coverage
+.coverage.*
+htmlcov/
+
+# =========================
+# Virtual Environment
+# =========================
+venv/
+.env
+.env.*
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Streamlit / Secrets
+# =========================
+# Keep secrets out of git (Streamlit often stores API keys here)
+.streamlit/
+!.streamlit/config.toml
+
+# =========================
+# PDFs & Documents (IMPORTANT)
+# =========================
+# Keep local source data out of git by default (Acts/PDFs can be large/copyrighted).
+# We still allow committing a placeholder file so the folder exists in GitHub.
+pdfs/*
+!pdfs/.gitkeep
+!pdfs/README.md
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.tif
+*.wav
+*.mp3
+*.m4a
+
+# =========================
+# Vector DB / LangChain / Chroma
+# =========================
+chrome_langchain_db/
+chrome_langchain_db_backup_*/
+chrome_langchain_db_corrupt_*/
+chrome_langchain_db_rebuild_*/
+*.sqlite3
+*.db
+
+# =========================
+# Large datasets (keep local)
+# =========================
+# Avoid ignoring ALL JSON (repos often contain legit config/metadata JSON).
+# Ignore only the large datasets used for ingestion.
+IndicLegalQA*.json
+
+# If you want ONLY this dataset ignored specifically, use instead:
+# IndicLegalQA_Dataset_10K_Revised.json
+
+# =========================
+# Caches / temp
+# =========================
+.cache/
+tmp/
+temp/
+*.tmp
+
+# =========================
+# Test artifacts
+# =========================
+test_performance_output/
+
+# =========================
+# Build / dist
+# =========================
+build/
+dist/
+*.egg-info/
