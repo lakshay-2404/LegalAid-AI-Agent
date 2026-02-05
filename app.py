@@ -62,10 +62,6 @@ def load_model(model_name: str, temperature: float, num_ctx: int, num_thread: in
         num_ctx=num_ctx,
         num_thread=num_thread,
         top_p=top_p,
-        # Hard cap on output length to avoid very long generations.
-        num_predict=700,
-        # Prevent indefinite hangs when the Ollama server/model is stalled.
-        client_kwargs={"timeout": 120},
     )
 
 # =========================
@@ -321,7 +317,7 @@ if st.session_state.queued_query:
 user_query = st.chat_input("Ask about an Act, section, or case…")
 if user_query:
     _append_and_answer(user_query)
-
+ 
 # =========================
 # Previous UI (kept for reference)
 # =========================
