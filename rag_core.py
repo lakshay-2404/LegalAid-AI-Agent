@@ -22,6 +22,12 @@ STOPWORDS = {
 
 PDF_DIR = Path(__file__).parent / "pdfs"
 
+# Guardrails to prevent extremely large prompts that can make local models appear to
+# "think forever". These are character-based (cheap) approximations.
+MAX_DOC_CHARS = 2400
+MAX_CONTEXT_CHARS = 18000
+MAX_CONTEXT_CHARS_OVERVIEW = 26000
+
 def preprocess_query(query: str) -> str:
     """
     Normalize and clean query for better retrieval.
@@ -125,6 +131,31 @@ RULES:
    - If you cannot cite a claim, omit it.
 4. Distinguish statutory provisions from case law when relevant.
 5. If sources conflict, state the conflict and cite both.
+
+LEGAL CONTEXT (prioritized by relevance):
+{context}
+
+QUESTION:
+{question}
+
+ANSWER:
+"""
+
+CLAUSE_PROMPT_TEMPLATE = """You are a legal information assistant specializing in Indian law.
+
+PRIORITY: Accuracy and source fidelity. Use ONLY the provided legal context.
+
+RULES:
+1. Do not add facts not supported by the sources.
+2. If the sources do not contain any rule relevant to assessing the clause, respond exactly: "Not found in retrieved sources."
+3. Cite sources after EACH paragraph using the exact format: [Source N]
+   - Use only the source number (do not invent citations).
+   - If you cannot cite a claim, omit it.
+4. For questions about whether a contract/employment clause is "allowed", "valid", or "enforceable":
+   - Identify the relevant provision(s) in the context.
+   - Explain what they say in plain language.
+   - Apply them to the clause described in the question and state the conclusion.
+   - Mention exceptions only if they appear in the context.
 
 LEGAL CONTEXT (prioritized by relevance):
 {context}
@@ -263,13 +294,40 @@ def detect_target_source_file(query: str) -> str | None:
     if not q_tokens:
         return None
 
+    # Expand common abbreviations for better filename matching.
+    if "bns" in q_tokens:
+        q_tokens |= {"bharatiya", "nyaya", "sanhita"}
+    if "cpc" in q_tokens:
+        q_tokens |= {"civil", "procedure"}
+    if "hma" in q_tokens:
+        q_tokens |= {"hindu", "marriage"}
+    if "ida" in q_tokens:
+        q_tokens |= {"divorce"}
+    if "bsa" in q_tokens or "sakshya" in q_tokens or "evidence" in q_tokens:
+        q_tokens |= {"bharatiya", "sakshya", "adhiniyam"}
+
+    # Also add abbreviations when the expanded names are present.
+    if {"bharatiya", "nyaya", "sanhita"} <= q_tokens:
+        q_tokens.add("bns")
+    if {"bharatiya", "sakshya", "adhiniyam"} <= q_tokens:
+        q_tokens.add("bsa")
+    if {"civil", "procedure"} <= q_tokens:
+        q_tokens.add("cpc")
+    if {"hindu", "marriage"} <= q_tokens:
+        q_tokens.add("hma")
+    if "divorce" in q_tokens and "act" in q_tokens:
+        q_tokens.add("ida")
+
     from difflib import SequenceMatcher
 
     best = (0.0, None)
-    # Prefer .md sources for Acts (cleaner than OCR PDFs).
-    candidates = list(PDF_DIR.glob("*.md"))
-    if not candidates:
-        candidates = list(PDF_DIR.glob("*.pdf"))
+    # Prefer .md/.json sources (cleaner than OCR PDFs) but include PDFs too so
+    # Acts that only exist as PDFs can still be matched.
+    candidates = (
+        sorted(PDF_DIR.glob("*.md"))
+        + sorted(PDF_DIR.glob("*.json"))
+        + sorted(PDF_DIR.glob("*.pdf"))
+    )
 
     for p in candidates:
         name = re.sub(r"[^a-z0-9]+", " ", p.stem.lower()).strip()
@@ -287,9 +345,600 @@ def detect_target_source_file(query: str) -> str | None:
 
 def expand_legal_query(query: str) -> list:
     """Expand query with legal synonyms and related terms."""
-    queries = [query]
-    query_lower = query.lower()
-    
+    return expand_legal_query_with_hints(query)
+
+
+def detect_issue_tags(query: str) -> set[str]:
+    q = (query or "").lower()
+    tags: set[str] = set()
+
+    # Contract / clause framing
+    if any(k in q for k in ["contract", "agreement", "clause", "terms", "offer letter", "bond"]):
+        tags.add("contract_clause")
+
+    # Contract-law concept queries that often omit the word "contract/act".
+    if any(
+        k in q
+        for k in [
+            "consideration",
+            "offer",
+            "acceptance",
+            "proposal",
+            "free consent",
+            "coercion",
+            "undue influence",
+            "misrepresentation",
+            "breach of contract",
+            "damages",
+            "compensation for breach",
+            "indemnity",
+            "guarantee",
+        ]
+    ):
+        tags.add("contract_concepts")
+
+    # Common employment/contract clause questions
+    if any(
+        k in q
+        for k in [
+            "non compete",
+            "non-compete",
+            "noncompete",
+            "competitor",
+            "same industry",
+            "restraint of trade",
+            "cant work",
+            "cannot work",
+            "work for another company",
+            "join another company",
+        ]
+    ):
+        tags.add("non_compete")
+
+    if any(k in q for k in ["bond", "penalty", "liquidated", "damages", "forfeit", "forfeiture"]):
+        tags.add("penalty_or_bond")
+
+    # Plain-language "bond/recovery if I leave early" patterns.
+    if ("training" in q or "service bond" in q) and any(k in q for k in ["pay", "recover", "recovery", "deduct", "amount", "cost"]):
+        tags.add("penalty_or_bond")
+    if any(k in q for k in ["leave before", "resign", "notice period"]) and any(k in q for k in ["pay", "recover", "deduct", "penalty", "bond"]):
+        tags.add("penalty_or_bond")
+
+    if any(
+        k in q
+        for k in [
+            "sue",
+            "lawsuit",
+            "legal proceedings",
+            "cannot go to court",
+            "no court",
+            "cannot sue",
+            "no legal action",
+            "no claim",
+            "no claims",
+            "cannot file case",
+            "time limit to sue",
+            "time limit to file",
+            "waive",
+            "waiver",
+        ]
+    ):
+        tags.add("restraint_legal_proceedings")
+
+    if any(k in q for k in ["arbitration", "arbitral", "arbitrator", "arbitrable"]):
+        tags.add("arbitration")
+
+    if any(k in q for k in ["limitation", "time barred", "time-barred", "barred by limitation"]):
+        tags.add("limitation")
+
+    if any(
+        k in q
+        for k in [
+            "evidence",
+            "admissible",
+            "admissibility",
+            "burden of proof",
+            "presumption",
+            "witness",
+            "testimony",
+            "cross examination",
+            "cross-examination",
+            "affidavit",
+            "documentary evidence",
+            "primary evidence",
+            "secondary evidence",
+            "electronic record",
+            "relevancy",
+            "relevance",
+        ]
+    ):
+        tags.add("evidence")
+
+    if any(
+        k in q
+        for k in [
+            "cpc",
+            "code of civil procedure",
+            "civil procedure",
+            "suit",
+            "plaint",
+            "written statement",
+            "summons",
+            "injunction",
+            "stay",
+            "decree",
+            "execution",
+            "appeal",
+            "revision",
+            "jurisdiction",
+            "interim order",
+        ]
+    ):
+        tags.add("civil_procedure")
+
+    if any(
+        k in q
+        for k in [
+            "bns",
+            "ipc",
+            "criminal",
+            "crime",
+            "offence",
+            "offense",
+            "fir",
+            "police",
+            "arrest",
+            "bail",
+            "chargesheet",
+            "charge sheet",
+            "charge-sheet",
+            "punishment",
+            "imprisonment",
+            "fine",
+            "theft",
+            "cheating",
+            "fraud",
+            "forgery",
+            "assault",
+            "murder",
+            "homicide",
+            "kidnapping",
+            "extortion",
+        ]
+    ):
+        tags.add("criminal")
+
+    if any(
+        k in q
+        for k in [
+            "marriage",
+            "hindu marriage",
+            "hindu marriage act",
+            "hma",
+            "restitution of conjugal rights",
+            "conjugal rights",
+            "judicial separation",
+            "annulment",
+            "bigamy",
+        ]
+    ):
+        tags.add("marriage")
+
+    if any(k in q for k in ["divorce", "dissolution", "alimony", "indian divorce act"]):
+        tags.add("divorce")
+
+    if any(k in q for k in ["delimitation", "constituency", "constituencies", "electoral boundaries"]):
+        tags.add("delimitation")
+
+    if any(k in q for k in ["refund", "replacement", "defect", "defective", "deficiency", "consumer", "unfair trade", "warranty"]):
+        tags.add("consumer")
+
+    # Common civil / personal-law buckets based on available corpus
+    if any(k in q for k in ["property", "sale deed", "gift deed", "lease", "rent", "tenant", "landlord", "mortgage"]):
+        tags.add("property")
+
+    if any(k in q for k in ["motor vehicle", "vehicle accident", "road accident", "driving licence", "driving license", "insurance claim"]):
+        tags.add("motor_vehicle")
+
+    if any(k in q for k in ["guardian", "guardianship", "minor custody"]):
+        tags.add("guardianship")
+
+    if any(k in q for k in ["adoption", "maintenance"]):
+        tags.add("adoption_maintenance")
+
+    if any(k in q for k in ["succession", "inheritance", "will", "probate"]):
+        tags.add("succession")
+
+    if any(k in q for k in ["specific performance", "injunction"]):
+        tags.add("specific_relief")
+
+    return tags
+
+
+ISSUE_SOURCE_BOOSTS: dict[str, list[str]] = {
+    # Contract/employment clauses
+    "contract_clause": ["Indian Contract Act 1872.md"],
+    "contract_concepts": ["Indian Contract Act 1872.md"],
+    "non_compete": ["Indian Contract Act 1872.md"],
+    "penalty_or_bond": ["Indian Contract Act 1872.md"],
+    "restraint_legal_proceedings": ["Indian Contract Act 1872.md"],
+    # Arbitration
+    "arbitration": ["Arbitration and Conciliation Act 1996.md"],
+    # Limitation / consumer
+    "limitation": ["Limitation Act 1963.md", "Indian Contract Act 1872.md"],
+    # Evidence / criminal / procedure
+    "evidence": ["bsa_final.md", "indiaCodeBSA.pdf"],
+    "criminal": [
+        "the-bharatiya-nyaya-sanhita-2023-485731.pdf",
+        "BNS2023.pdf",
+        "BNS Book_After Correction.pdf",
+    ],
+    "civil_procedure": ["cpc.json", "the_code_of_civil_procedure,_1908.pdf", "Civil-Procedure-Code-and-Limitation-Act.pdf"],
+    "consumer": ["Consumer Protection Act 2019.md", "Consumer Protection Act 1986.md"],
+    # Civil/personal law buckets (available in pdfs/)
+    "property": ["Transfer of Property Act 1882.md"],
+    "motor_vehicle": ["Motor Vehicles Act 1988.md"],
+    "guardianship": ["Hindu Minority and Guardianship Act 1956.md"],
+    "adoption_maintenance": ["Hindu Adoptions and Maintenance Act 1956.md"],
+    "succession": ["Indian Succession Act 1925.md"],
+    "specific_relief": ["Specific Relief Act 1963.md"],
+    "marriage": ["hma.json"],
+    "divorce": ["ida.json", "hma.json"],
+    "delimitation": ["Delimitation Act 2002.md"],
+}
+
+# "Legal knowledge layer" section injections: deterministic statutory anchors (by metadata)
+# that we can pull even when user phrasing is vague. Keep these small and high-signal.
+ISSUE_SECTION_INJECTIONS: dict[str, dict[str, list[str]]] = {
+    "non_compete": {"Indian Contract Act 1872.md": ["27"]},
+    "penalty_or_bond": {"Indian Contract Act 1872.md": ["73", "74"]},
+    "restraint_legal_proceedings": {"Indian Contract Act 1872.md": ["28"]},
+    "arbitration": {"Arbitration and Conciliation Act 1996.md": ["7"]},
+}
+
+
+def extract_section_refs(query: str) -> list[str]:
+    """
+    Extract section references like "section 27", "s. 27", "section 13b", "sec 10a".
+    Returns normalized section IDs like ["27", "13B", "10A"].
+    """
+    q = (query or "").lower()
+    refs: list[str] = []
+
+    # Basic forms: section 27 / sec 27 / s. 27 / s 27
+    for m in re.finditer(r"\b(?:section|sec|s)\.?\s*([0-9]{1,4}[a-z]?)\b", q):
+        refs.append(m.group(1))
+
+    # Normalize: uppercase trailing alpha suffix (e.g., 13b -> 13B)
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in refs:
+        r = (r or "").strip()
+        if not r:
+            continue
+        m = re.match(r"^([0-9]{1,4})([a-z])?$", r, flags=re.IGNORECASE)
+        if not m:
+            continue
+        sec = m.group(1)
+        suf = (m.group(2) or "").upper()
+        norm = f"{sec}{suf}"
+        if norm not in seen:
+            out.append(norm)
+            seen.add(norm)
+    return out
+
+
+def _collection_get_docs(where: dict, limit: int | None = None) -> List[Document]:
+    """
+    Read matching docs directly from the underlying Chroma collection using metadata filters.
+    This is used by the "knowledge layer" for deterministic statute retrieval.
+    """
+    # Chroma's `where` expects a single operator at the top-level. When multiple
+    # conditions are provided, combine them with `$and`.
+    if where and len(where) > 1 and not any(str(k).startswith("$") for k in where.keys()):
+        where = {"$and": [{k: v} for k, v in where.items()]}
+
+    try:
+        if limit is not None:
+            data = vector.vector_store._collection.get(
+                where=where,
+                include=["documents", "metadatas"],
+                limit=limit,
+            )
+        else:
+            data = vector.vector_store._collection.get(where=where, include=["documents", "metadatas"])
+    except TypeError:
+        # Older Chroma versions may not accept `limit`.
+        try:
+            data = vector.vector_store._collection.get(where=where, include=["documents", "metadatas"])
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+    docs: List[Document] = []
+    for doc, meta, docid in zip(
+        data.get("documents") or [],
+        data.get("metadatas") or [],
+        data.get("ids") or [],
+    ):
+        if not doc:
+            continue
+        meta = meta or {}
+        if docid and "doc_id" not in meta:
+            meta["doc_id"] = docid
+        # Mark as injected so debugging/telemetry (if added later) can distinguish.
+        meta.setdefault("kb_injected", True)
+        docs.append(Document(page_content=doc, metadata=meta))
+    return docs
+
+
+def knowledge_layer_injections(
+    issue_tags: set[str],
+    query: str,
+    sources_to_boost: list[str],
+    max_sections_total: int = 6,
+) -> List[Document]:
+    """
+    Inject high-signal statutory sections based on detected issues and explicit section refs.
+    """
+    injected: List[Document] = []
+
+    # 1) Issue-driven section injections (deterministic).
+    section_targets: list[tuple[str, str]] = []  # (source, section)
+    for tag in issue_tags:
+        by_source = ISSUE_SECTION_INJECTIONS.get(tag) or {}
+        for src, secs in by_source.items():
+            for s in secs:
+                section_targets.append((src, str(s)))
+
+    # 2) Explicit section refs (user asked for "Section X" but may not name the Act).
+    sec_refs = extract_section_refs(query)
+    if sec_refs:
+        src_hint = detect_target_source_file(query) or (sources_to_boost[0] if sources_to_boost else None)
+        if src_hint:
+            for s in sec_refs:
+                section_targets.append((src_hint, s))
+
+    # De-dupe and cap total work.
+    seen_pairs: set[tuple[str, str]] = set()
+    capped: list[tuple[str, str]] = []
+    for src, sec in section_targets:
+        key = (src, sec)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        capped.append(key)
+        if len(capped) >= max_sections_total:
+            break
+
+    for src, sec in capped:
+        injected.extend(_collection_get_docs({"source": src, "section": sec}, limit=6))
+
+    return injected
+
+
+def sources_for_issue_tags(tags: set[str]) -> list[str]:
+    sources: list[str] = []
+    for t in tags:
+        sources.extend(ISSUE_SOURCE_BOOSTS.get(t, []))
+    # De-dupe while preserving order.
+    out: list[str] = []
+    seen: set[str] = set()
+    for s in sources:
+        if s in seen:
+            continue
+        out.append(s)
+        seen.add(s)
+    return out
+
+
+def is_clause_enforceability_query(query: str) -> bool:
+    """
+    Heuristic for "Is this clause legal/allowed/enforceable?" type questions.
+    These benefit from statutory-anchor retrieval and a clause-specific prompt.
+    """
+    q = (query or "").lower()
+
+    enforceability_language = any(
+        k in q
+        for k in [
+            "allowed",
+            "legal",
+            "valid",
+            "enforceable",
+            "binding",
+            "void",
+            "illegal",
+            "can they",
+            "can i",
+        ]
+    )
+    if not enforceability_language:
+        return False
+
+    clause_markers = any(k in q for k in ["contract", "agreement", "clause", "terms", "bond", "offer letter", "sign"])
+    tags = detect_issue_tags(q)
+    implied_clause = bool(tags & {"non_compete", "penalty_or_bond", "restraint_legal_proceedings", "arbitration"})
+
+    return clause_markers or implied_clause
+
+
+def source_filtered_retrieve(query: str, source: str, k: int = 8) -> List[Document]:
+    """
+    Vector-only retrieval restricted to a single source file.
+    Useful when user phrasing doesn't match statutory wording and global retrieval misses the key Act.
+    """
+    try:
+        hits = vector.vector_store.similarity_search_with_score(query, k=k, filter={"source": source})
+    except Exception:
+        return []
+    return [d for d, _score in hits]
+
+
+def expand_legal_query_with_hints(
+    query: str,
+    issue_tags: set[str] | None = None,
+    max_variants: int = 6,
+) -> list[str]:
+    """
+    Build a small set of query variants to improve recall when users use plain language.
+
+    Design:
+    - Keep the list short for performance.
+    - Put high-signal statutory anchors first so they don't get truncated.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+
+    tags = issue_tags or detect_issue_tags(q)
+
+    anchors: list[str] = []
+    # Statutory anchors (high signal)
+    if "non_compete" in tags:
+        anchors.extend(
+            [
+                "section 27 agreement in restraint of trade void indian contract act 1872",
+                "agreement in restraint of trade void section 27",
+            ]
+        )
+
+    if "contract_concepts" in tags:
+        anchors.extend(
+            [
+                "indian contract act 1872 consideration offer acceptance free consent coercion undue influence misrepresentation breach damages",
+            ]
+        )
+
+    if "penalty_or_bond" in tags:
+        anchors.extend(
+            [
+                "section 74 penalty stipulated compensation breach contract indian contract act 1872",
+                "section 73 compensation for breach of contract indian contract act 1872",
+            ]
+        )
+
+    if "restraint_legal_proceedings" in tags:
+        anchors.extend(
+            [
+                "section 28 agreements in restraint of legal proceedings void indian contract act 1872",
+                "contract clause time limit to sue void section 28",
+            ]
+        )
+
+    if "arbitration" in tags:
+        anchors.extend(
+            [
+                "section 7 arbitration agreement arbitration and conciliation act 1996",
+                "arbitration clause in a contract section 7",
+            ]
+        )
+
+    if "limitation" in tags:
+        anchors.extend(
+            [
+                "limitation act 1963 time barred period of limitation",
+                "barred by limitation limitation act 1963",
+            ]
+        )
+
+    if "consumer" in tags:
+        anchors.extend(
+            [
+                "consumer protection act 2019 defect deficiency unfair trade practice",
+                "consumer refund replacement warranty deficiency",
+            ]
+        )
+
+    if "property" in tags:
+        anchors.extend(
+            [
+                "transfer of property act 1882 lease rent mortgage sale gift",
+            ]
+        )
+
+    if "motor_vehicle" in tags:
+        anchors.extend(
+            [
+                "motor vehicles act 1988 accident compensation insurance",
+            ]
+        )
+
+    if "guardianship" in tags:
+        anchors.extend(
+            [
+                "hindu minority and guardianship act 1956 guardian minor custody",
+            ]
+        )
+
+    if "adoption_maintenance" in tags:
+        anchors.extend(
+            [
+                "hindu adoptions and maintenance act 1956 adoption maintenance",
+            ]
+        )
+
+    if "succession" in tags:
+        anchors.extend(
+            [
+                "indian succession act 1925 will probate succession inheritance",
+            ]
+        )
+
+    if "specific_relief" in tags:
+        anchors.extend(
+            [
+                "specific relief act 1963 specific performance injunction",
+            ]
+        )
+
+    if "civil_procedure" in tags:
+        anchors.extend(
+            [
+                "code of civil procedure cpc suit plaint written statement decree execution injunction",
+                "cpc order rule decree execution",
+            ]
+        )
+
+    if "evidence" in tags:
+        anchors.extend(
+            [
+                "bharatiya sakshya adhiniyam 2023 evidence admissibility relevancy burden of proof",
+                "relevancy of facts bharatiya sakshya adhiniyam 2023",
+            ]
+        )
+
+    if "criminal" in tags:
+        anchors.extend(
+            [
+                "bharatiya nyaya sanhita bns offence punishment imprisonment fine",
+                "bns section punishment for offence",
+            ]
+        )
+
+    if "marriage" in tags:
+        anchors.extend(
+            [
+                "hindu marriage act 1955 marriage judicial separation restitution of conjugal rights",
+            ]
+        )
+
+    if "divorce" in tags:
+        anchors.extend(
+            [
+                "divorce act 1869 dissolution of marriage grounds",
+            ]
+        )
+
+    if "delimitation" in tags:
+        anchors.extend(
+            [
+                "delimitation act 2002 delimitation of constituencies",
+            ]
+        )
+
+    # Generic synonyms (medium signal)
     expansions = {
         "punishment": ["penalty", "sentence", "imprisonment"],
         "offence": ["offense", "crime", "criminal act"],
@@ -302,16 +951,55 @@ def expand_legal_query(query: str) -> list:
         "ipc": ["indian penal code", "penal code"],
         "right": ["privilege", "entitlement", "liberty"],
         "liability": ["responsibility", "legal obligation"],
+        # Employment/non-compete phrasing often doesn't match statutory wording.
+        "non compete": ["non-compete", "restraint of trade"],
+        "non-compete": ["non compete", "restraint of trade"],
+        "noncompete": ["non compete", "restraint of trade"],
+        "cant work": ["cannot work", "restraint of trade"],
+        "cannot work": ["cant work", "restraint of trade"],
+        "same industry": ["restraint of trade", "trade restriction"],
+        # Bonds / penalties
+        "bond": ["penalty", "liquidated damages", "compensation for breach"],
+        "liquidated damages": ["penalty", "compensation for breach"],
+        # Courts / suing
+        "sue": ["legal proceedings", "court"],
+        "lawsuit": ["legal proceedings", "court"],
+        # Evidence act phrasing
+        "evidence": ["sakshya", "bharatiya sakshya adhiniyam", "relevancy of facts"],
+        "admissible": ["admissibility", "relevant", "relevancy"],
+        "burden": ["burden of proof"],
+        # CPC phrasing
+        "injunction": ["temporary injunction", "interim order"],
+        "decree": ["execution of decree"],
+        # Family law
+        "divorce": ["dissolution of marriage", "judicial separation", "alimony"],
     }
-    
+
+    variants: list[str] = [q]
+    variants.extend(anchors)
+
     for term, synonyms in expansions.items():
-        if term in query_lower:
+        if term in q:
             for syn in synonyms:
-                expanded = query.lower().replace(term, syn)
-                if expanded not in [q.lower() for q in queries]:
-                    queries.append(expanded)
-    
-    return queries[:3]
+                # Prefer short, high-signal variants.
+                replaced = q.replace(term, syn)
+                if replaced != q:
+                    variants.append(replaced)
+                variants.append(syn)
+
+    # De-duplicate while preserving order, then truncate.
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in variants:
+        v = (v or "").strip().lower()
+        if not v or v in seen:
+            continue
+        out.append(v)
+        seen.add(v)
+        if len(out) >= max_variants:
+            break
+
+    return out
 
 def estimate_context_confidence(docs: List[Document]) -> float:
     """Estimate confidence in retrieved context (0-1)."""
@@ -471,6 +1159,26 @@ def build_context(
     
     blocks = []
     doc_number = 1
+    max_context_chars = MAX_CONTEXT_CHARS_OVERVIEW if is_overview else MAX_CONTEXT_CHARS
+    context_chars = 0
+
+    def _add_block(source_text: str, content: str) -> None:
+        nonlocal doc_number, context_chars
+        if context_chars >= max_context_chars:
+            return
+        content = (content or "").strip()
+        if not content:
+            return
+        if len(content) > MAX_DOC_CHARS:
+            content = content[:MAX_DOC_CHARS].rstrip() + "\n...[truncated]"
+        block = f"[Source {doc_number}: {source_text}]\n{content}"
+        # Roughly account for separators and headers.
+        projected = context_chars + len(block) + 10
+        if projected > max_context_chars and context_chars > 0:
+            return
+        blocks.append(block)
+        context_chars = projected
+        doc_number += 1
     
     # Add statutory sources first (higher authority) - prioritize for overviews
     for d in statutory[:max_docs_adjusted // 2 + 3 if is_overview else max_docs_adjusted // 2 + 2]:
@@ -486,13 +1194,12 @@ def build_context(
             src.append(f"Chapter: {meta['chapter']}")
         
         source_text = " | ".join(src) if src else meta.get("source", "Unknown")
-        blocks.append(
-            f"[Source {doc_number}: {source_text}]\n{d.page_content}"
-        )
-        doc_number += 1
+        _add_block(source_text, d.page_content)
     
     # Add case law sources (supporting evidence)
     for d in case_law[:max_docs_adjusted - len(blocks)]:
+        if context_chars >= max_context_chars:
+            break
         meta = d.metadata
         src = ["Case Law"]
         if meta.get("act"):
@@ -501,10 +1208,7 @@ def build_context(
             src.append(f"Source: {meta['source']}")
         
         source_text = " | ".join(src)
-        blocks.append(
-            f"[Source {doc_number}: {source_text}]\n{d.page_content}"
-        )
-        doc_number += 1
+        _add_block(source_text, d.page_content)
     
     context = "\n\n---\n\n".join(blocks)
     confidence = estimate_context_confidence(docs)
@@ -563,26 +1267,53 @@ def answer_query(
     
     # 2️⃣ PREPROCESS QUERY
     clean_query = preprocess_query(query)
+
+    issue_tags = detect_issue_tags(clean_query)
+    clause_query = is_clause_enforceability_query(clean_query)
+    issue_force = bool(issue_tags - {"contract_clause"})
+
+    # Plain-language clause/issue questions benefit from broader retrieval.
+    retrieval_k = 60 if is_overview else (45 if clause_query or issue_force or "contract_clause" in issue_tags else 30)
+    max_variants = 8 if len(issue_tags) >= 2 else 6
+    query_variants = expand_legal_query_with_hints(clean_query, issue_tags=issue_tags, max_variants=max_variants)
+    sources_to_boost = sources_for_issue_tags(issue_tags)
+
+    # If the query mentions an Act by name (or close to it), boost that source directly.
+    target_source_hint = detect_target_source_file(clean_query)
+    if target_source_hint and target_source_hint not in sources_to_boost:
+        sources_to_boost = [target_source_hint] + sources_to_boost
     
     # 3) BASE RETRIEVAL FIRST (precision-first); only expand if needed
     all_docs = {}
     doc_relevance = {}
 
-    def merge_results(q: str) -> None:
-        retrieved = vector.hybrid_retrieve(q, k=retrieval_k)
+    def merge_docs(retrieved: List[Document], q: str, score_floor: float | None = None) -> None:
         for doc in retrieved:
             doc_id = _doc_key(doc)
             score = calculate_relevance_score(q, doc)
+            if score_floor is not None:
+                score = max(score, score_floor)
             if doc_id not in all_docs:
                 all_docs[doc_id] = doc
                 doc_relevance[doc_id] = score
             else:
                 doc_relevance[doc_id] = max(doc_relevance[doc_id], score)
 
+    def merge_results(q: str) -> None:
+        merge_docs(vector.hybrid_retrieve(q, k=retrieval_k), q)
+
     merge_results(clean_query)
 
     # 4) FILTER BY RELEVANCE THRESHOLD (precision-first)
-    min_relevance = 0.25 if is_overview else 0.30
+    # Clause/issue queries often use plain language, so use a slightly lower threshold.
+    min_relevance = 0.25 if (is_overview or clause_query or issue_force) else 0.30
+
+    # Knowledge-layer injection: deterministically pull key statutory sections (by metadata) when possible.
+    kb_docs = knowledge_layer_injections(issue_tags, clean_query, sources_to_boost, max_sections_total=6)
+    if kb_docs:
+        # Give injected docs a relevance floor so they aren't dropped by heuristics.
+        merge_docs(kb_docs, clean_query, score_floor=max(min_relevance + 0.05, 0.45))
+
     relevant_docs = [doc for doc_id, doc in all_docs.items() if doc_relevance[doc_id] >= min_relevance]
 
     # If the query is clearly about a specific Act, try a metadata-filtered retrieval
@@ -720,13 +1451,58 @@ def answer_query(
                     else:
                         doc_relevance[doc_id] = max(doc_relevance[doc_id], score)
 
-    # Expand only if too few relevant docs (recall assist without over-expanding)
-    if len(relevant_docs) < (8 if is_overview else 6):
-        for q in expand_legal_query(clean_query):
-            if q == clean_query:
-                continue
-            merge_results(q)
+    # Recall/rescue: plain-language legal queries often miss the exact statutory wording.
+    ordered_ids = sorted(all_docs.keys(), key=lambda i: doc_relevance.get(i, 0.0), reverse=True)
+    top_docs = [all_docs[i] for i in ordered_ids[:12]]
+    base_conf = estimate_context_confidence(top_docs)
+    base_statutory = sum(1 for d in top_docs if d.metadata.get("doc_type") in {"pdf", "md", "json"})
+    needs_help = (base_conf < (0.50 if is_overview else 0.45)) or (base_statutory < (3 if is_overview else 2))
+
+    should_expand = (
+        clause_query
+        or issue_force
+        or needs_help
+        or (len(relevant_docs) < (8 if is_overview else 6))
+    )
+
+    if should_expand:
+        for qv in query_variants[1:4]:
+            if qv and qv != clean_query:
+                merge_results(qv)
+
+        # If we can infer likely Acts, do a source-restricted vector search for extra recall.
+        if sources_to_boost and (clause_query or issue_force or needs_help):
+            boost_queries = query_variants[:3] or [clean_query]
+            for src in sources_to_boost[:3]:
+                for qv in boost_queries:
+                    merge_docs(source_filtered_retrieve(qv, src, k=8), qv)
+
         relevant_docs = [doc for doc_id, doc in all_docs.items() if doc_relevance[doc_id] >= min_relevance]
+        ordered_ids = sorted(all_docs.keys(), key=lambda i: doc_relevance.get(i, 0.0), reverse=True)
+
+    # Always keep a small pool even if relevance heuristics are pessimistic.
+    if all_docs:
+        max_keep = 90 if is_overview else 60
+        min_keep = 18 if is_overview else 12
+
+        filtered_ids = [i for i in ordered_ids if doc_relevance.get(i, 0.0) >= min_relevance]
+        pool_ids = filtered_ids if len(filtered_ids) >= min_keep else ordered_ids[:min_keep]
+
+        # Ensure we have at least a couple statutory sources when available.
+        statutory_in_pool = sum(
+            1 for i in pool_ids if all_docs[i].metadata.get("doc_type") in {"pdf", "md", "json"}
+        )
+        if statutory_in_pool < 2:
+            for i in ordered_ids:
+                if i in pool_ids:
+                    continue
+                if all_docs[i].metadata.get("doc_type") in {"pdf", "md", "json"}:
+                    pool_ids.append(i)
+                    statutory_in_pool += 1
+                    if statutory_in_pool >= 2:
+                        break
+
+        relevant_docs = [all_docs[i] for i in pool_ids[:max_keep]]
 
     # 5) DEDUPLICATE DOCUMENTS
     relevant_docs = deduplicate_docs(relevant_docs, similarity_threshold=0.85)
@@ -768,7 +1544,12 @@ def answer_query(
         return annotate_answer(answer, 0.2, "General knowledge (not from RAG)"), []
     
     # 9️⃣ GENERATE ANSWER (use appropriate prompt)
-    prompt_template = OVERVIEW_PROMPT_TEMPLATE if is_overview else PROMPT_TEMPLATE
+    if is_overview:
+        prompt_template = OVERVIEW_PROMPT_TEMPLATE
+    elif clause_query:
+        prompt_template = CLAUSE_PROMPT_TEMPLATE
+    else:
+        prompt_template = PROMPT_TEMPLATE
     prompt = prompt_template.format(
         context=context,
         question=query,

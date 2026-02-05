@@ -447,7 +447,11 @@ def load_model():
         model=MODEL,
         temperature=0.1,
         num_ctx=2048,
-        num_thread=4
+        num_thread=4,
+        # Hard cap on output length to avoid very long generations.
+        num_predict=500,
+        # Prevent indefinite hangs when the Ollama server/model is stalled.
+        client_kwargs={"timeout": 120},
     )
 
 model = load_model()

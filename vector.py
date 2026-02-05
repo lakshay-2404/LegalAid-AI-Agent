@@ -138,23 +138,36 @@ def extract_legal_structure(text: str) -> dict:
     """Enhanced extraction with hierarchical structure and Indian legal acts."""
     meta = {}
 
-    # Expanded act names
-    act_patterns = [
-        r"(Bharatiya Nyaya Sanhita|BNS)",
-        r"(Indian Penal Code|IPC)",
-        r"(Code of Civil Procedure|CPC)",
-        r"(Bharatiya Nagarik Suraksha Sanhita|BNSS)",
-        r"(Code of Criminal Procedure|CrPC)",
-        r"(Limitation Act)",
-        r"(Constitution of India)",
-        r"(Right to Information Act|RTI)",
-        r"(Protection of Women from Domestic Violence Act)",
+    # Act detection: use word boundaries for acronyms to avoid false matches
+    # (e.g., "RTI" would otherwise match the "rti" in "parties").
+    act_patterns: list[tuple[str, str]] = [
+        (r"\bBNS\b|Bharatiya\s+Nyaya\s+Sanhita", "Bharatiya Nyaya Sanhita"),
+        (r"\bIPC\b|Indian\s+Penal\s+Code", "Indian Penal Code"),
+        (r"\bCPC\b|Code\s+of\s+Civil\s+Procedure", "Code of Civil Procedure"),
+        (r"\bCrPC\b|Code\s+of\s+Criminal\s+Procedure", "Code of Criminal Procedure"),
+        (r"\bBNSS\b|Bharatiya\s+Nagarik\s+Suraksha\s+Sanhita", "Bharatiya Nagarik Suraksha Sanhita"),
+        (r"\bBSA\b|Bharatiya\s+Sakshya\s+Adhiniyam", "Bharatiya Sakshya Adhiniyam"),
+        (r"Indian\s+Contract\s+Act", "Indian Contract Act"),
+        (r"Arbitration\s+and\s+Conciliation\s+Act", "Arbitration and Conciliation Act"),
+        (r"Consumer\s+Protection\s+Act", "Consumer Protection Act"),
+        (r"Specific\s+Relief\s+Act", "Specific Relief Act"),
+        (r"Transfer\s+of\s+Property\s+Act", "Transfer of Property Act"),
+        (r"Motor\s+Vehicles\s+Act", "Motor Vehicles Act"),
+        (r"Indian\s+Succession\s+Act", "Indian Succession Act"),
+        (r"Hindu\s+Marriage\s+Act", "Hindu Marriage Act"),
+        (r"\bDivorce\s+Act\b|Indian\s+Divorce\s+Act", "Indian Divorce Act"),
+        (r"Hindu\s+Minority\s+and\s+Guardianship\s+Act", "Hindu Minority and Guardianship Act"),
+        (r"Hindu\s+Adoptions\s+and\s+Maintenance\s+Act", "Hindu Adoptions and Maintenance Act"),
+        (r"Delimitation\s+Act", "Delimitation Act"),
+        (r"Limitation\s+Act", "Limitation Act"),
+        (r"Constitution\s+of\s+India", "Constitution of India"),
+        (r"\bRTI\b|Right\s+to\s+Information\s+Act", "Right to Information Act"),
+        (r"Protection\s+of\s+Women\s+from\s+Domestic\s+Violence\s+Act", "Protection of Women from Domestic Violence Act"),
     ]
 
-    for pattern in act_patterns:
-        act = re.search(pattern, text, re.IGNORECASE)
-        if act:
-            meta["act"] = act.group(1).replace("|", "/")
+    for pattern, act_name in act_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            meta["act"] = act_name
             break
 
     # Chapter
