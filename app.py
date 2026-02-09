@@ -10,7 +10,7 @@ import vector
 # STREAMLIT CONFIG
 # =========================
 
-st.set_page_config(page_title="Indian Legal RAG", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="NyayGram", layout="wide", initial_sidebar_state="expanded")
 
 
 # NOTE: Color/theme overrides (CSS) were causing readability issues in the sidebar
@@ -47,7 +47,7 @@ st.set_page_config(page_title="Indian Legal RAG", layout="wide", initial_sidebar
 #
 # inject_minimal_css()
 
-st.markdown("## Indian Legal RAG")
+st.markdown("## Nyaygram")
 st.caption("Precision-first answers from ingested legal documents, with clear provenance/confidence.")
 
 # =========================
