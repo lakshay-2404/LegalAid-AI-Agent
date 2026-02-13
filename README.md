@@ -61,7 +61,7 @@ flowchart LR
     bm25[(SQLite BM25 corpus)]
   end
 
-  subgraph GRAPH[Graph Store (optional)]
+  subgraph GRAPH[Graph Store - optional]
     neo4j[(Neo4j)]
   end
 
