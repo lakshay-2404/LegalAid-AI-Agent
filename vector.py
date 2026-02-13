@@ -2,20 +2,24 @@ from pathlib import Path
 import csv
 import hashlib
 import json
+import logging
+import os
 import re
+import sqlite3
 import threading
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
-import pytesseract
-from pdf2image import convert_from_path
 from rank_bm25 import BM25Okapi
 
 from langchain_core.documents import Document
-from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
+
+from vector_store import MilvusConfig, MilvusVectorStore, infer_embedding_dim
+
+logger = logging.getLogger(__name__)
 
 # =====================================================
 # PATHS
@@ -37,6 +41,8 @@ COLLECTION_NAME = "indian_legal_rag"
 SUPPORTED_EXTENSIONS = {".pdf", ".md", ".json"}
 DISCOVER_DIRS = [PDF_DIR]
 MANIFEST_PATH = DB_DIR / "ingest_manifest.json"
+BM25_DB_PATH = DB_DIR / "bm25.sqlite"
+EMBED_DIM_PATH = DB_DIR / "embed_dim.json"
 
 INGEST_SCHEMA_VERSION = 2
 
@@ -54,47 +60,6 @@ VECTOR_QUERY_RETRY_SLEEP_S = 1.0
 _ingest_lock = threading.Lock()
 _bm25_lock = threading.Lock()
 _did_ingest = False
-
-
-def _is_hnsw_load_error(err: Exception) -> bool:
-    msg = str(err).lower()
-    return (
-        "hnsw" in msg
-        and ("error loading" in msg or "segment reader" in msg or "error constructing" in msg)
-    )
-
-
-def _repair_chroma_db() -> bool:
-    """
-    Best-effort repair for corrupted Chroma HNSW indexes.
-    Strategy: move the persist directory aside and rebuild from sources.
-
-    Returns True if we moved the directory, False otherwise.
-    """
-    global DB_DIR, MANIFEST_PATH
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    backup_dir = BASE_DIR / f"{DB_DIR.name}_corrupt_{ts}"
-    try:
-        if DB_DIR.exists():
-            DB_DIR.rename(backup_dir)
-        DB_DIR.mkdir(exist_ok=True)
-        print(f"Repaired Chroma DB by moving corrupted directory to: {backup_dir}")
-        return True
-    except Exception as e:
-        # If we can't rename (common on Windows due to locked files), fall back to creating
-        # a fresh DB directory next to the existing one so the app can keep working.
-        print(f"Warning: failed to move corrupted Chroma DB directory: {e}")
-        new_dir = BASE_DIR / f"{DB_DIR.name}_rebuild_{ts}"
-        try:
-            new_dir.mkdir(exist_ok=True)
-            DB_DIR = new_dir
-            MANIFEST_PATH = DB_DIR / "ingest_manifest.json"
-            print(f"Using a new Chroma DB directory instead: {DB_DIR}")
-            return True
-        except Exception as e2:
-            print(f"Warning: failed to create replacement Chroma DB directory: {e2}")
-            print(f"Manual fix: close the app, then rename/delete: {DB_DIR}")
-            return False
 
 # =====================================================
 # EMBEDDINGS
@@ -207,6 +172,18 @@ def extract_legal_structure(text: str) -> dict:
 def ocr_pdf(pdf_path: Path, dpi: int = OCR_DPI) -> str:
     """Enhanced OCR with better DPI, multi-language support, and retry logic."""
     try:
+        try:
+            from pdf2image import convert_from_path
+        except Exception as e:
+            print(f"OCR unavailable (missing pdf2image): {e}")
+            return ""
+
+        try:
+            import pytesseract
+        except Exception as e:
+            print(f"OCR unavailable (missing pytesseract): {e}")
+            return ""
+
         images = convert_from_path(str(pdf_path), dpi=dpi)
         text = []
 
@@ -685,29 +662,126 @@ class QAIndexer:
 # VECTOR STORE
 # =====================================================
 
-vector_store = Chroma(
-    collection_name=COLLECTION_NAME,
-    persist_directory=str(DB_DIR),
-    embedding_function=embeddings,
-    collection_metadata={"hnsw:space": "cosine"},
-)
+vector_store: Optional[MilvusVectorStore] = None
+_vector_store_init_error: Optional[str] = None
 
-# If the on-disk HNSW index is corrupted, Chroma queries can hard-fail.
-# Detect and attempt a one-time repair by moving the DB aside and rebuilding.
-try:
-    _ = vector_store._collection.count()
-except Exception as e:
-    if _is_hnsw_load_error(e):
-        if _repair_chroma_db():
-            vector_store = Chroma(
-                collection_name=COLLECTION_NAME,
-                persist_directory=str(DB_DIR),
-                embedding_function=embeddings,
-                collection_metadata={"hnsw:space": "cosine"},
-            )
-    else:
-        # Non-HNSW errors should surface so we don't hide real problems.
+
+def _load_cached_embed_dim() -> Optional[int]:
+    try:
+        if EMBED_DIM_PATH.exists():
+            payload = json.loads(EMBED_DIM_PATH.read_text(encoding="utf-8"))
+            dim = int(payload.get("dim"))
+            return dim if dim > 0 else None
+    except Exception:
+        return None
+    return None
+
+
+def _cache_embed_dim(dim: int) -> None:
+    try:
+        EMBED_DIM_PATH.write_text(json.dumps({"dim": dim}, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def get_embedding_dim() -> int:
+    cached = _load_cached_embed_dim()
+    if cached:
+        return cached
+
+    env = os.environ.get("EMBEDDING_DIM")
+    if env:
+        try:
+            dim = int(env)
+            if dim > 0:
+                _cache_embed_dim(dim)
+                return dim
+        except Exception:
+            pass
+
+    # Last resort: probe the embedding server.
+    try:
+        dim = infer_embedding_dim(embeddings.embed_query)
+        _cache_embed_dim(dim)
+        return dim
+    except Exception as e:
+        raise RuntimeError(
+            "Could not infer embedding dimension. Start Ollama (for the embedding probe) "
+            "or set EMBEDDING_DIM, then retry."
+        ) from e
+
+
+def get_vector_store() -> MilvusVectorStore:
+    global vector_store, _vector_store_init_error
+    if vector_store is not None:
+        return vector_store
+    if _vector_store_init_error:
+        raise RuntimeError(_vector_store_init_error)
+
+    dim = get_embedding_dim()
+    cfg = MilvusConfig.from_env(dim=dim)
+    try:
+        vector_store = MilvusVectorStore(
+            config=cfg,
+            embed_documents=embeddings.embed_documents,
+            embed_query=embeddings.embed_query,
+        )
+        return vector_store
+    except Exception as e:
+        _vector_store_init_error = f"Failed to initialize Milvus vector store: {e}"
         raise
+
+
+_graph_store = None
+_graph_store_init_error: Optional[str] = None
+
+
+def _graph_enabled() -> bool:
+    return os.environ.get("ENABLE_GRAPH", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_graph_store():
+    """
+    Lazy Neo4j initialization. Returns None if disabled or unavailable.
+    """
+    global _graph_store, _graph_store_init_error
+    if not _graph_enabled():
+        return None
+    if _graph_store is not None:
+        return _graph_store
+    if _graph_store_init_error:
+        return None
+    try:
+        from graph_store import GraphStore, Neo4jConfig
+
+        gs = GraphStore(Neo4jConfig.from_env())
+        gs.ensure_schema()
+        _graph_store = gs
+        return _graph_store
+    except Exception as e:
+        _graph_store_init_error = str(e)
+        logger.warning("Neo4j init failed; graph layer disabled: %s", e)
+        return None
+
+
+def _graph_upsert_docs(docs: List[Document]) -> None:
+    gs = get_graph_store()
+    if not gs:
+        return
+    try:
+        gs.upsert_chunks(docs)
+    except Exception as e:
+        logger.warning("Neo4j upsert failed: %s", e)
+
+
+def _graph_delete_doc_ids(doc_ids: List[str]) -> None:
+    gs = get_graph_store()
+    if not gs:
+        return
+    try:
+        gs.delete_chunks(doc_ids)
+    except Exception as e:
+        logger.warning("Neo4j delete failed: %s", e)
 
 
 # =====================================================
@@ -735,7 +809,8 @@ def delete_doc_ids(doc_ids: List[str]) -> None:
     if not doc_ids:
         return
     try:
-        vector_store._collection.delete(ids=doc_ids)
+        get_vector_store().delete_by_ids(doc_ids)
+        _graph_delete_doc_ids(doc_ids)
     except Exception as e:
         print(f"Warning: could not delete old docs: {e}")
 
@@ -768,20 +843,25 @@ def ingest_documents() -> None:
     if _did_ingest:
         return
 
+    vs = get_vector_store()
+    _bm25_db_init()
+
     # Streamlit reruns can create concurrent calls in edge cases; guard with a lock.
     with _ingest_lock:
         if _did_ingest:
             return
     manifest = load_manifest()
     manifest_files = manifest.get("files", {})
+    changed = False
     # If the DB directory was recreated/wiped but the manifest is still present,
     # the incremental logic would "skip" everything and leave an empty collection.
     # Detect that and force a full re-ingest.
     try:
-        if vector_store._collection.count() == 0 and manifest_files:
+        if vs.count() == 0 and manifest_files:
             print("Manifest exists but collection is empty; forcing full re-ingest.")
             manifest_files = {}
             manifest = {"schema_version": INGEST_SCHEMA_VERSION, "files": {}}
+            changed = True
     except Exception:
         # If count fails, we will attempt ingestion anyway.
         pass
@@ -802,8 +882,11 @@ def ingest_documents() -> None:
     removed = manifest_keys - current_keys
     if removed:
         for rel in removed:
-            delete_doc_ids(manifest_files.get(rel, {}).get("doc_ids", []))
+            old_ids = manifest_files.get(rel, {}).get("doc_ids", [])
+            delete_doc_ids(old_ids)
+            _bm25_db_delete_ids(old_ids)
             manifest_files.pop(rel, None)
+            changed = True
 
     for rel, path in current_files.items():
         file_hash = compute_file_hash(path)
@@ -812,7 +895,10 @@ def ingest_documents() -> None:
             continue
 
         if existing:
-            delete_doc_ids(existing.get("doc_ids", []))
+            old_ids = existing.get("doc_ids", [])
+            delete_doc_ids(old_ids)
+            _bm25_db_delete_ids(old_ids)
+            changed = True
 
         # Streaming ingestion to reduce peak memory usage.
         # Old approach (kept for reference):
@@ -838,23 +924,42 @@ def ingest_documents() -> None:
             chunk_index += 1
 
             if len(docs_batch) >= BATCH_SIZE:
-                vector_store.add_documents(docs_batch, ids=ids_batch)
+                try:
+                    vs.add_documents(docs_batch, ids=ids_batch)
+                    _bm25_db_upsert_docs(docs_batch, ids_batch)
+                    _graph_upsert_docs(docs_batch)
+                except Exception as e:
+                    print(f"Warning: failed to ingest batch for {rel}: {e}")
                 docs_batch = []
                 ids_batch = []
 
         if docs_batch:
-            vector_store.add_documents(docs_batch, ids=ids_batch)
+            try:
+                vs.add_documents(docs_batch, ids=ids_batch)
+                _bm25_db_upsert_docs(docs_batch, ids_batch)
+                _graph_upsert_docs(docs_batch)
+            except Exception as e:
+                print(f"Warning: failed to ingest final batch for {rel}: {e}")
 
         if not doc_ids:
             manifest_files.pop(rel, None)
             continue
 
         manifest_files[rel] = {"hash": file_hash, "doc_ids": doc_ids}
+        changed = True
 
     manifest["schema_version"] = INGEST_SCHEMA_VERSION
     manifest["files"] = manifest_files
     save_manifest(manifest)
     _did_ingest = True
+
+    if changed and os.environ.get("AUTO_DOCS", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        try:
+            from documentation_generator import regenerate_docs_if_needed
+
+            regenerate_docs_if_needed(force=False)
+        except Exception as e:
+            logger.warning("Docs regeneration failed: %s", e)
 
 
 # Ingestion behavior:
@@ -875,7 +980,7 @@ def ensure_ingested(force: bool = False) -> None:
         return
 
     try:
-        if vector_store._collection.count() == 0:
+        if get_vector_store().count() == 0:
             ingest_documents()
             return
     except Exception:
@@ -896,15 +1001,15 @@ def rebuild_index() -> None:
         _bm25 = None
         _all_docs = []
 
-        # Best-effort: delete collection contents.
+        # Best-effort: drop the collection and recreate it on next use.
         try:
-            vector_store._collection.delete(where={})
-        except Exception:
-            # Fallback: drop and recreate collection via client if supported.
-            try:
-                vector_store._client.delete_collection(COLLECTION_NAME)
-            except Exception:
-                pass
+            from pymilvus import utility  # type: ignore[import-untyped]
+
+            coll = os.environ.get("MILVUS_COLLECTION", COLLECTION_NAME)
+            if utility.has_collection(coll):
+                utility.drop_collection(coll)
+        except Exception as e:
+            print(f"Warning: failed to drop Milvus collection: {e}")
 
         # Reset manifest so ingest happens as "first run".
         try:
@@ -913,19 +1018,17 @@ def rebuild_index() -> None:
         except Exception as e:
             print(f"Warning: failed to remove manifest: {e}")
 
-        # Recreate vector store handle to ensure a clean collection.
-        vector_store = Chroma(
-            collection_name=COLLECTION_NAME,
-            persist_directory=str(DB_DIR),
-            embedding_function=embeddings,
-            collection_metadata={"hnsw:space": "cosine"},
-        )
+        # Reset BM25 local corpus.
+        try:
+            if BM25_DB_PATH.exists():
+                BM25_DB_PATH.unlink()
+        except Exception as e:
+            print(f"Warning: failed to reset BM25 db: {e}")
+
+        # Force re-init of vector store on next call.
+        vector_store = None
 
         ingest_documents()
-
-
-print("Initializing vector store...")
-ensure_ingested()
 
 
 def index_status() -> dict:
@@ -939,7 +1042,7 @@ def index_status() -> dict:
         "collection_name": COLLECTION_NAME,
     }
     try:
-        status["count"] = vector_store._collection.count()
+        status["count"] = get_vector_store().count()
         status["count_error"] = None
     except Exception as e:
         status["count"] = None
@@ -955,6 +1058,82 @@ _bm25 = None
 _all_docs: List[Document] = []
 
 
+def _bm25_db_connect() -> sqlite3.Connection:
+    BM25_DB_PATH.parent.mkdir(exist_ok=True)
+    conn = sqlite3.connect(str(BM25_DB_PATH))
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    return conn
+
+
+def _bm25_db_init() -> None:
+    try:
+        with _bm25_db_connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS corpus (
+                    doc_id TEXT PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_corpus_doc_id ON corpus(doc_id);")
+    except Exception as e:
+        logger.warning("Failed to init BM25 db: %s", e)
+
+
+def _bm25_db_delete_ids(doc_ids: List[str]) -> None:
+    if not doc_ids:
+        return
+    try:
+        with _bm25_db_connect() as conn:
+            for i in range(0, len(doc_ids), 900):
+                batch = doc_ids[i : i + 900]
+                placeholders = ",".join("?" for _ in batch)
+                conn.execute(f"DELETE FROM corpus WHERE doc_id IN ({placeholders});", batch)
+    except Exception as e:
+        logger.warning("Failed to delete BM25 rows: %s", e)
+
+
+def _bm25_db_upsert_docs(docs: List[Document], ids: List[str]) -> None:
+    if not docs:
+        return
+    try:
+        rows: list[tuple[str, str, str]] = []
+        for doc, doc_id in zip(docs, ids):
+            meta = doc.metadata or {}
+            meta.setdefault("doc_id", doc_id)
+            rows.append((doc_id, doc.page_content or "", json.dumps(meta, ensure_ascii=False)))
+        with _bm25_db_connect() as conn:
+            conn.executemany("INSERT OR REPLACE INTO corpus (doc_id, text, metadata_json) VALUES (?, ?, ?);", rows)
+    except Exception as e:
+        logger.warning("Failed to upsert BM25 rows: %s", e)
+
+
+def _bm25_db_load_docs() -> List[Document]:
+    try:
+        with _bm25_db_connect() as conn:
+            if BM25_MAX_DOCS and BM25_MAX_DOCS > 0:
+                cur = conn.execute("SELECT doc_id, text, metadata_json FROM corpus LIMIT ?;", (BM25_MAX_DOCS,))
+            else:
+                cur = conn.execute("SELECT doc_id, text, metadata_json FROM corpus;")
+            out: List[Document] = []
+            for doc_id, text, meta_json in cur.fetchall():
+                meta = {}
+                try:
+                    meta = json.loads(meta_json or "{}")
+                except Exception:
+                    meta = {}
+                meta.setdefault("doc_id", doc_id)
+                out.append(Document(page_content=text or "", metadata=meta))
+            return out
+    except Exception as e:
+        logger.warning("Failed to load BM25 corpus: %s", e)
+        return []
+
+
 def ensure_bm25() -> None:
     global _bm25, _all_docs
     if _bm25 is not None:
@@ -963,33 +1142,8 @@ def ensure_bm25() -> None:
         if _bm25 is not None:
             return
 
-        try:
-            # Some Chroma versions do not accept "ids" as an include item; ids are returned separately.
-            data = vector_store._collection.get(include=["documents", "metadatas"])
-        except Exception as e:
-            print(f"Warning: Could not load documents for BM25: {e}")
-            _bm25 = None
-            _all_docs = []
-            return
-
-        documents = data.get("documents") or []
-        metadatas = data.get("metadatas") or []
-        ids = data.get("ids") or []
-
-        docs = []
-        for doc, meta, doc_id in zip(documents, metadatas, ids):
-            if not doc:
-                continue
-            meta = meta or {}
-            # Preserve stable IDs if present (improves dedup across pipelines).
-            if doc_id and "doc_id" not in meta:
-                meta["doc_id"] = doc_id
-            docs.append(Document(page_content=doc, metadata=meta))
-
-        if BM25_MAX_DOCS and len(docs) > BM25_MAX_DOCS:
-            docs = docs[:BM25_MAX_DOCS]
-
-        _all_docs = docs
+        _bm25_db_init()
+        _all_docs = _bm25_db_load_docs()
         if not _all_docs:
             _bm25 = None
             return
@@ -1011,12 +1165,13 @@ def hybrid_retrieve(query: str, k: int = 10, max_distance: float = 0.5) -> List[
     Returns merged, deduplicated results ranked by combined score.
     60% vector weight + 40% BM25 weight = better semantic + keyword coverage.
     """
-    vector_hits = []
-    # Chroma can transiently fail if the HNSW index is being compacted or is partially corrupted.
+    ensure_ingested()
+    vector_hits: list[tuple[Document, float]] = []
+    # Milvus calls can transiently fail during load/index transitions.
     # Retry a couple times, then fall back to BM25-only if needed.
     for attempt in range(VECTOR_QUERY_RETRIES + 1):
         try:
-            vector_hits = vector_store.similarity_search_with_score(query, k=20)
+            vector_hits = get_vector_store().similarity_search_with_score(query, k=20)
             break
         except Exception as e:
             if attempt >= VECTOR_QUERY_RETRIES:

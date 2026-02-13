@@ -1,5 +1,6 @@
 from typing import List, Tuple
 import hashlib
+import os
 import re
 from pathlib import Path
 
@@ -630,46 +631,18 @@ def extract_section_refs(query: str) -> list[str]:
 
 def _collection_get_docs(where: dict, limit: int | None = None) -> List[Document]:
     """
-    Read matching docs directly from the underlying Chroma collection using metadata filters.
+    Read matching docs directly from the underlying vector store using metadata filters.
     This is used by the "knowledge layer" for deterministic statute retrieval.
     """
-    # Chroma's `where` expects a single operator at the top-level. When multiple
-    # conditions are provided, combine them with `$and`.
-    if where and len(where) > 1 and not any(str(k).startswith("$") for k in where.keys()):
-        where = {"$and": [{k: v} for k, v in where.items()]}
-
     try:
-        if limit is not None:
-            data = vector.vector_store._collection.get(
-                where=where,
-                include=["documents", "metadatas"],
-                limit=limit,
-            )
-        else:
-            data = vector.vector_store._collection.get(where=where, include=["documents", "metadatas"])
-    except TypeError:
-        # Older Chroma versions may not accept `limit`.
-        try:
-            data = vector.vector_store._collection.get(where=where, include=["documents", "metadatas"])
-        except Exception:
-            return []
+        vector.ensure_ingested()
+        docs = vector.get_vector_store().get_docs(where, limit=limit)
     except Exception:
         return []
 
-    docs: List[Document] = []
-    for doc, meta, docid in zip(
-        data.get("documents") or [],
-        data.get("metadatas") or [],
-        data.get("ids") or [],
-    ):
-        if not doc:
-            continue
-        meta = meta or {}
-        if docid and "doc_id" not in meta:
-            meta["doc_id"] = docid
-        # Mark as injected so debugging/telemetry (if added later) can distinguish.
-        meta.setdefault("kb_injected", True)
-        docs.append(Document(page_content=doc, metadata=meta))
+    for d in docs:
+        d.metadata = d.metadata or {}
+        d.metadata.setdefault("kb_injected", True)
     return docs
 
 
@@ -770,7 +743,8 @@ def source_filtered_retrieve(query: str, source: str, k: int = 8) -> List[Docume
     Useful when user phrasing doesn't match statutory wording and global retrieval misses the key Act.
     """
     try:
-        hits = vector.vector_store.similarity_search_with_score(query, k=k, filter={"source": source})
+        vector.ensure_ingested()
+        hits = vector.get_vector_store().similarity_search_with_score(query, k=k, filter={"source": source})
     except Exception:
         return []
     return [d for d, _score in hits]
@@ -1308,6 +1282,19 @@ def answer_query(
     # Clause/issue queries often use plain language, so use a slightly lower threshold.
     min_relevance = 0.25 if (is_overview or clause_query or issue_force) else 0.30
 
+    # Graph-augmented vector retrieval (optional): use Neo4j traversal to restrict Milvus search to a
+    # high-signal candidate set (Act/Section neighborhood).
+    if os.environ.get("ENABLE_GRAPH", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            from orchestrator import get_orchestrator
+
+            gdocs = get_orchestrator().graph_vector_retrieve(clean_query, k=min(retrieval_k, 20))
+            if gdocs:
+                # Give a small relevance floor to keep graph hits in the pool.
+                merge_docs(gdocs, clean_query, score_floor=max(min_relevance, 0.35))
+        except Exception:
+            pass
+
     # Knowledge-layer injection: deterministically pull key statutory sections (by metadata) when possible.
     kb_docs = knowledge_layer_injections(issue_tags, clean_query, sources_to_boost, max_sections_total=6)
     if kb_docs:
@@ -1322,36 +1309,14 @@ def answer_query(
         # First: try to match the Act by filename (very reliable for "what is <act>" queries).
         target_source = detect_target_source_file(clean_query)
         if target_source:
-            try:
-                data = vector.vector_store._collection.get(
-                    where={"source": target_source},
-                    include=["documents", "metadatas"],
-                    limit=1200,
-                )
-            except TypeError:
-                try:
-                    data = vector.vector_store._collection.get(
-                        where={"source": target_source},
-                        include=["documents", "metadatas"],
-                    )
-                except Exception:
-                    data = None
-            except Exception:
-                data = None
-
-            if data:
-                for doc, meta in zip(data.get("documents") or [], data.get("metadatas") or []):
-                    if not doc:
-                        continue
-                    meta = meta or {}
-                    d = Document(page_content=doc, metadata=meta)
-                    doc_id = _doc_key(d)
-                    score = calculate_relevance_score(clean_query, d)
-                    if doc_id not in all_docs:
-                        all_docs[doc_id] = d
-                        doc_relevance[doc_id] = score
-                    else:
-                        doc_relevance[doc_id] = max(doc_relevance[doc_id], score)
+            for d in _collection_get_docs({"source": target_source}, limit=1200):
+                doc_id = _doc_key(d)
+                score = calculate_relevance_score(clean_query, d)
+                if doc_id not in all_docs:
+                    all_docs[doc_id] = d
+                    doc_relevance[doc_id] = score
+                else:
+                    doc_relevance[doc_id] = max(doc_relevance[doc_id], score)
 
         # Recompute relevant docs after filename/act enrichment (important).
         relevant_docs = [doc for doc_id, doc in all_docs.items() if doc_relevance[doc_id] >= min_relevance]
@@ -1360,12 +1325,8 @@ def answer_query(
         target_act = detect_target_act(clean_query, list(all_docs.values()))
         if target_act:
             try:
-                act_hits = vector.vector_store.similarity_search_with_score(
-                    clean_query, k=retrieval_k, filter={"act": target_act}
-                )
-            except TypeError:
-                # Some LangChain versions use `filter` on similarity_search, not similarity_search_with_score.
-                act_hits = [(d, 0.0) for d in vector.vector_store.similarity_search(clean_query, k=retrieval_k, filter={"act": target_act})]
+                vector.ensure_ingested()
+                act_hits = vector.get_vector_store().similarity_search_with_score(clean_query, k=retrieval_k, filter={"act": target_act})
             except Exception:
                 act_hits = []
 
@@ -1380,37 +1341,8 @@ def answer_query(
 
             # Also fetch an "outline" set from that Act using metadata-only access.
             # This helps overview queries pull in definitions/scope sections that embeddings may miss.
-            data = None
-            try:
-                data = vector.vector_store._collection.get(
-                    where={"act": target_act},
-                    include=["documents", "metadatas"],
-                    limit=800,
-                )
-            except TypeError:
-                try:
-                    data = vector.vector_store._collection.get(
-                        where={"act": target_act},
-                        include=["documents", "metadatas"],
-                    )
-                except Exception:
-                    data = None
-            except Exception:
-                data = None
-
-            if data:
-                docs = []
-                for doc, meta, docid in zip(
-                    data.get("documents") or [],
-                    data.get("metadatas") or [],
-                    data.get("ids") or [],
-                ):
-                    if not doc:
-                        continue
-                    meta = meta or {}
-                    if docid and "doc_id" not in meta:
-                        meta["doc_id"] = docid
-                    docs.append(Document(page_content=doc, metadata=meta))
+            docs = _collection_get_docs({"act": target_act}, limit=800)
+            if docs:
 
                 def sec_num(d: Document) -> int:
                     s = d.metadata.get("section")

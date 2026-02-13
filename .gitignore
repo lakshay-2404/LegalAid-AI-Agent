@@ -52,6 +52,8 @@ IndicLegalQA_Dataset_10K_Revised.json
 .cache/
 tmp/
 temp/
+_tmp_mdgen/
+docs/.autogen_state.json
 
 # =========================
 # Test artifacts
