@@ -1,4 +1,4 @@
-# LegalAid-AI Agent - Technical Documentation
+# LegalAid-AI Agent - Technical Documentation (One-Time, Human Authored)
 
 This document explains what each part of the repository does, how the system works end-to-end, and why the major engineering choices were made. It is intentionally *not* auto-generated (unlike `docs/ARCHITECTURE.md`).
 
@@ -41,7 +41,7 @@ The system is a Hybrid RAG:
 - **LLM synthesis (Ollama)**: local generation constrained by a citation-first prompt contract.
 - **UI (Streamlit)**: interactive chat + controls to rebuild the index and inspect basic health.
 
-
+```mermaid
 flowchart LR
   subgraph UI[Streamlit]
     st[app.py]
@@ -71,11 +71,12 @@ flowchart LR
   v --> bm25
   orch --> neo4j
   orch --> milvus
+```
 
 ## Data Flows (Ingestion + Query)
 
 ### Ingestion sequence
-
+```mermaid
 sequenceDiagram
   participant CLI as ingestion_pipeline.py
   participant V as vector.py
@@ -105,9 +106,10 @@ sequenceDiagram
   opt AUTO_DOCS=1
     CLI->>D: regenerate_docs_if_needed()
   end
+```
 
 ### Query sequence
-
+```mermaid
 sequenceDiagram
   participant UI as app.py
   participant RC as rag_core.py
@@ -133,7 +135,7 @@ sequenceDiagram
   RC->>RC: build_context() + confidence
   RC->>LLM: model.invoke(prompt with [Source N] blocks)
   RC->>UI: answer + provenance + confidence
-
+```
 
 ## Repository Tour
 
@@ -550,3 +552,13 @@ This script exists so the runtime system does not need a dependency on Chroma, b
 - `test_performance.py` references `vector.retriever`, which is not present in the current codebase; it likely predates the Milvus refactor.
 - Some files contain mojibake characters (e.g., `â€”`, `â€¦`) which typically indicates a UTF-8/CP1252 display mismatch. The core pipeline uses UTF-8 reads/writes and `ensure_ascii=False` for JSON where possible, but you may want to normalize file encodings in your editor/terminal for clean UI output.
 
+## Suggested Next Hardening Steps (If You Move Toward Production)
+
+- Add structured configuration (pydantic settings) and a single config module to avoid env var drift.
+- Add a "readiness check" endpoint for Milvus/Neo4j/Ollama.
+- Add unit tests for:
+  - manifest-based incremental ingestion behavior
+  - `_dict_to_expr()` filter translation
+  - rag_core citation hygiene utilities
+- Add a background ingestion job + queue if ingestion becomes frequent.
+- Add proper secrets management (do not pass DB passwords as plain env vars in real deployments).
