@@ -1,4 +1,4 @@
-# LegalAid-AI Agent - Technical Documentation (One-Time, Human Authored)
+# LegalAid-AI Agent - Technical Documentation
 
 This document explains what each part of the repository does, how the system works end-to-end, and why the major engineering choices were made. It is intentionally *not* auto-generated (unlike `docs/ARCHITECTURE.md`).
 
@@ -41,7 +41,7 @@ The system is a Hybrid RAG:
 - **LLM synthesis (Ollama)**: local generation constrained by a citation-first prompt contract.
 - **UI (Streamlit)**: interactive chat + controls to rebuild the index and inspect basic health.
 
-```mermaid
+
 flowchart LR
   subgraph UI[Streamlit]
     st[app.py]
@@ -71,12 +71,11 @@ flowchart LR
   v --> bm25
   orch --> neo4j
   orch --> milvus
-```
 
 ## Data Flows (Ingestion + Query)
 
 ### Ingestion sequence
-```mermaid
+
 sequenceDiagram
   participant CLI as ingestion_pipeline.py
   participant V as vector.py
@@ -106,10 +105,9 @@ sequenceDiagram
   opt AUTO_DOCS=1
     CLI->>D: regenerate_docs_if_needed()
   end
-```
 
 ### Query sequence
-```mermaid
+
 sequenceDiagram
   participant UI as app.py
   participant RC as rag_core.py
@@ -135,7 +133,7 @@ sequenceDiagram
   RC->>RC: build_context() + confidence
   RC->>LLM: model.invoke(prompt with [Source N] blocks)
   RC->>UI: answer + provenance + confidence
-```
+
 
 ## Repository Tour
 
