@@ -1,4 +1,4 @@
-# LegalAid-AI Agent - Technical Documentation (One-Time, Human Authored)
+# NyayGram- Legal AI Agent 
 
 This document explains what each part of the repository does, how the system works end-to-end, and why the major engineering choices were made. It is intentionally *not* auto-generated (unlike `docs/ARCHITECTURE.md`).
 
