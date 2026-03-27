@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import unicodedata
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass, field
@@ -72,6 +73,7 @@ class GenerationConfig:
     json_max_str_preview: int = 8000
 
     write_error_report: bool = True
+    also_write_txt: bool = False
 
 
 @dataclass
@@ -102,7 +104,22 @@ def _atomic_write_text(path: Path, text: str) -> None:
     try:
         with tmp.open("w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-        os.replace(tmp, path)
+        last_err = None
+        for _ in range(3):
+            try:
+                os.replace(tmp, path)
+                last_err = None
+                break
+            except PermissionError as e:
+                last_err = e
+                try:
+                    if path.exists():
+                        path.unlink()
+                except Exception:
+                    pass
+                time.sleep(0.1)
+        if last_err:
+            raise last_err
     finally:
         try:
             if tmp.exists():
@@ -379,7 +396,7 @@ def _heading_line_to_md(line: str) -> str | None:
     m = re.match(r"^(\d{1,4}[A-Z]?)\.\s+(.+)$", s)
     if m and len(s) <= 160:
         return f"## {m.group(1)}. {m.group(2).strip()}"
-    m = re.match(r"^(\d{1,4}[A-Z]?)\s+([A-Za-z][A-Za-z0-9 ,:;()\"'\\-/]{3,})$", s)
+    m = re.match(r"^(\d{1,4}[A-Z]?)\s+([A-Za-z][A-Za-z0-9 ,:;()\"'\\\\/\\-]{3,})$", s)
     if m and len(s) <= 120:
         return f"## {m.group(1)}. {m.group(2).strip()}"
 
@@ -648,6 +665,62 @@ def _pdf_spool_pages_pypdf(
         raise GenerationError(f"Failed to read PDF {pdf_path.name}: {e}") from e
 
 
+def _pdf_spool_pages_pymupdf(
+    pdf_path: Path,
+    spool_dir: Path,
+    *,
+    max_pages: int | None,
+    config: GenerationConfig,
+) -> tuple[int, str, list[bool]]:
+    try:
+        import fitz  # PyMuPDF
+    except Exception as e:  # pragma: no cover
+        raise GenerationError(f"Missing dependency pymupdf: {e}") from e
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:  # pragma: no cover
+        raise GenerationError(f"Failed to open PDF with PyMuPDF: {e}") from e
+
+    try:
+        page_count = len(doc)
+        if max_pages is not None:
+            page_count = min(page_count, max_pages)
+
+        preview_parts: list[str] = []
+        page_poor: list[bool] = []
+
+        for i in range(page_count):
+            try:
+                page = doc.load_page(i)
+                t = page.get_text("text") or ""
+            except Exception as e:
+                logger.warning("PyMuPDF extraction failed on page %s (%s): %s", i + 1, pdf_path.name, e)
+                t = ""
+
+            norm = normalize_extracted_text(t)
+            _spool_write_page(spool_dir, i + 1, norm)
+            if len(preview_parts) < 5:
+                preview_parts.append(norm)
+            if config.ocr_mode == "hybrid":
+                page_poor.append(
+                    _is_text_poor(
+                        norm,
+                        min_len=config.min_page_text_len_for_ocr,
+                        min_space_ratio=config.min_space_ratio,
+                        max_avg_word_len=config.max_avg_word_len,
+                    )
+                )
+
+        preview_text = "\n".join(preview_parts)
+        return page_count, preview_text, page_poor
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
 def _pdf_page_count_via_pdf2image(pdf_path: Path) -> int:
     try:
         from pdf2image import pdfinfo_from_path
@@ -674,6 +747,7 @@ def _ocr_pdf_page(pdf_path: Path, page_num_1based: int, *, config: GenerationCon
         raise GenerationError(f"Missing dependency pytesseract: {e}") from e
 
     last_err: Exception | None = None
+    rendered_any = False
     for dpi in (config.ocr_dpi, config.ocr_dpi_retry):
         if dpi <= 0:
             continue
@@ -686,15 +760,27 @@ def _ocr_pdf_page(pdf_path: Path, page_num_1based: int, *, config: GenerationCon
             )
             if not images:
                 return ""
-            txt = pytesseract.image_to_string(images[0], lang=config.ocr_langs)
-            txt = normalize_extracted_text(txt)
-            if txt.strip():
-                return txt
+            rendered_any = True
+            img = images[0]
+            txt_primary = pytesseract.image_to_string(img, lang=config.ocr_langs)
+            txt_primary = normalize_extracted_text(txt_primary)
+            if txt_primary.strip():
+                return txt_primary
+            # Second attempt with a layout-friendly PSM
+            txt_psm6 = pytesseract.image_to_string(img, lang=config.ocr_langs, config="--psm 6")
+            txt_psm6 = normalize_extracted_text(txt_psm6)
+            if txt_psm6.strip():
+                return txt_psm6
         except Exception as e:
             last_err = e
             continue
 
-    raise GenerationError(f"OCR failed on page {page_num_1based} of {pdf_path.name}: {last_err}")
+    if last_err is not None:
+        raise GenerationError(f"OCR failed on page {page_num_1based} of {pdf_path.name}: {last_err}")
+    # If we rendered but got no text, return empty string (non-fatal) so page is skipped quietly.
+    if rendered_any:
+        return ""
+    raise GenerationError(f"OCR failed on page {page_num_1based} of {pdf_path.name}: unknown rendering error")
 
 
 def convert_pdf_to_markdown(pdf_path: Path, output_path: Path, config: GenerationConfig) -> GenerationResult:
@@ -716,7 +802,7 @@ def convert_pdf_to_markdown(pdf_path: Path, output_path: Path, config: Generatio
     try:
         extraction_failed: Exception | None = None
         try:
-            page_count, preview_text, hybrid_page_poor = _pdf_spool_pages_pypdf(
+            page_count, preview_text, hybrid_page_poor = _pdf_spool_pages_pymupdf(
                 pdf_path,
                 spool_dir,
                 max_pages=config.max_pages,
@@ -724,17 +810,28 @@ def convert_pdf_to_markdown(pdf_path: Path, output_path: Path, config: Generatio
             )
         except PdfPasswordError:
             raise
-        except GenerationError as e:
-            extraction_failed = e
-            if config.ocr_mode == "never":
+        except Exception as e_pymu:
+            # Fallback to PyPDF if PyMuPDF fails
+            try:
+                page_count, preview_text, hybrid_page_poor = _pdf_spool_pages_pypdf(
+                    pdf_path,
+                    spool_dir,
+                    max_pages=config.max_pages,
+                    config=config,
+                )
+            except PdfPasswordError:
                 raise
-            page_count = _pdf_page_count_via_pdf2image(pdf_path)
-            if page_count <= 0:
-                raise GenerationError(f"{e}. OCR fallback could not determine page count.") from e
-            if config.max_pages is not None:
-                page_count = min(page_count, config.max_pages)
-            preview_text = ""
-            hybrid_page_poor = []
+            except GenerationError as e:
+                extraction_failed = e
+                if config.ocr_mode == "never":
+                    raise
+                page_count = _pdf_page_count_via_pdf2image(pdf_path)
+                if page_count <= 0:
+                    raise GenerationError(f"{e}. OCR fallback could not determine page count.") from e
+                if config.max_pages is not None:
+                    page_count = min(page_count, config.max_pages)
+                preview_text = ""
+                hybrid_page_poor = []
 
         result.pages_processed = page_count
 
@@ -804,9 +901,11 @@ def convert_pdf_to_markdown(pdf_path: Path, output_path: Path, config: Generatio
 
         tmp_out = output_path.with_name(f".{output_path.name}.tmp.{os.getpid()}")
         wrote_any = False
+        paragraph_json = {"case_id": pdf_path.stem, "source": str(pdf_path), "pages": page_count, "paragraphs": []}
         try:
             with tmp_out.open("w", encoding="utf-8", newline="\n") as out:
                 out.write(f"# {title}\n\n")
+                para_idx = 1
                 for idx in range(1, page_count + 1):
                     page_text = _spool_read_page(spool_dir, idx)
                     cleaned = strip_headers_footers(
@@ -819,8 +918,24 @@ def convert_pdf_to_markdown(pdf_path: Path, output_path: Path, config: Generatio
                     md = text_to_markdown(cleaned, already_normalized=True)
                     if md.strip():
                         wrote_any = True
-                        out.write(md.strip())
+                        md_block = md.strip()
+                        out.write(md_block)
                         out.write("\n\n")
+
+                        for para in _md_to_paragraphs(md_block):
+                            para_clean = para.strip()
+                            if len(para_clean) < 20:
+                                continue
+                            paragraph_json["paragraphs"].append(
+                                {
+                                    "id": para_idx,
+                                    "paragraph_number": para_idx,
+                                    "page": idx,
+                                    "text": para_clean,
+                                    "case_id": pdf_path.stem,
+                                }
+                            )
+                            para_idx += 1
                     if config.emit_page_breaks and idx != page_count and md.strip():
                         out.write(config.page_break_marker.strip())
                         out.write("\n\n")
@@ -835,6 +950,12 @@ def convert_pdf_to_markdown(pdf_path: Path, output_path: Path, config: Generatio
                 pass
 
         if wrote_any:
+            # Write structured paragraph JSON alongside markdown
+            try:
+                json_path = output_path.with_suffix(".json")
+                _atomic_write_text(json_path, json.dumps(paragraph_json, ensure_ascii=False, indent=2))
+            except Exception as e:
+                result.add_warning(f"Could not write paragraph JSON: {e}")
             result.ok = True
         else:
             result.add_error("No extractable text (text extraction and OCR produced no content).")
@@ -1129,6 +1250,45 @@ def convert_file_to_markdown(
     return res
 
 
+def _md_to_plain_text(md: str) -> str:
+    """Strip markdown formatting to produce clean plain text for RAG ingestion."""
+    text = md
+    # Remove heading markers
+    text = re.sub(r"(?m)^#{1,6}\s+", "", text)
+    # Remove bold/italic markers
+    text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)
+    # Remove horizontal rules
+    text = re.sub(r"(?m)^---+\s*$", "", text)
+    # Remove code block fences
+    text = re.sub(r"```[a-z]*\n?", "", text)
+    # Clean up extra whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def write_txt_from_md(md_path: Path) -> Path:
+    """Read a .md file and write a corresponding .txt with plain text."""
+    txt_path = md_path.with_suffix(".txt")
+    md_content = md_path.read_text(encoding="utf-8")
+    plain = _md_to_plain_text(md_content)
+    _atomic_write_text(txt_path, plain + "\n")
+    return txt_path
+
+
+def _md_to_paragraphs(md: str) -> list[str]:
+    """Split markdown into paragraph blocks, skipping headings."""
+    blocks = re.split(r"\n{2,}", md)
+    out: list[str] = []
+    for block in blocks:
+        b = block.strip()
+        if not b:
+            continue
+        if b.startswith("#"):
+            continue
+        out.append(b)
+    return out
+
+
 def _discover_inputs(paths: list[Path], recursive: bool) -> list[Path]:
     out: list[Path] = []
     for p in paths:
@@ -1149,6 +1309,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recursive", action="store_true", help="Recurse into directories")
     parser.add_argument("--no-overwrite", action="store_true", help="Do not overwrite existing .md outputs")
     parser.add_argument("--ocr-mode", choices=["auto", "never", "always", "hybrid"], default="auto")
+    parser.add_argument("--txt", action="store_true", help="Also write a plain-text .txt file (better for RAG ingestion)")
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG/INFO/WARNING/ERROR)")
     args = parser.parse_args(argv)
 
@@ -1157,7 +1318,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s: %(message)s",
     )
 
-    cfg = GenerationConfig(ocr_mode=args.ocr_mode)
+    cfg = GenerationConfig(ocr_mode=args.ocr_mode, also_write_txt=args.txt)
     inputs = [Path(s) for s in args.inputs]
     files = _discover_inputs(inputs, recursive=args.recursive)
     if not files:
@@ -1176,6 +1337,9 @@ def main(argv: list[str] | None = None) -> int:
             if res.ok:
                 ok += 1
                 logger.info("Wrote: %s", res.output_path)
+                if cfg.also_write_txt:
+                    txt_path = write_txt_from_md(res.output_path)
+                    logger.info("Wrote TXT: %s", txt_path)
             else:
                 logger.error("Failed: %s", f)
         except Exception as e:

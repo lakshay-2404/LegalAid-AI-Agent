@@ -142,18 +142,13 @@ class MilvusVectorStore:
 
         if utility.has_collection(self._config.collection, using=self._alias):
             self._collection = Collection(self._config.collection, using=self._alias)
-            # Best-effort schema dim validation.
-            try:
-                for f in self._collection.schema.fields:
-                    if f.name == "embedding":
-                        existing_dim = int(getattr(f, "params", {}).get("dim") or getattr(f, "dim", 0) or 0)
-                        if existing_dim and existing_dim != self._config.dim:
-                            raise ValueError(
-                                f"Milvus collection dim mismatch: existing={existing_dim} expected={self._config.dim}"
-                            )
-            except Exception:
-                # If schema introspection changes, do not hard fail here.
-                pass
+            existing_dim = self._get_existing_embedding_dim()
+            if existing_dim and existing_dim != self._config.dim:
+                raise ValueError(
+                    "Milvus collection dim mismatch: "
+                    f"existing={existing_dim} expected={self._config.dim}. "
+                    "Reset the collection or align the embedding provider before ingesting."
+                )
         else:
             fields = [
                 FieldSchema(
@@ -169,10 +164,10 @@ class MilvusVectorStore:
                 FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=self._config.varchar_max_length),
                 FieldSchema(name="source_path", dtype=DataType.VARCHAR, max_length=1024),
                 FieldSchema(name="act", dtype=DataType.VARCHAR, max_length=256),
-                FieldSchema(name="chapter", dtype=DataType.VARCHAR, max_length=64),
-                FieldSchema(name="section", dtype=DataType.VARCHAR, max_length=64),
-                FieldSchema(name="subsection", dtype=DataType.VARCHAR, max_length=64),
-                FieldSchema(name="clause", dtype=DataType.VARCHAR, max_length=64),
+                FieldSchema(name="chapter", dtype=DataType.VARCHAR, max_length=256),
+                FieldSchema(name="section", dtype=DataType.VARCHAR, max_length=256),
+                FieldSchema(name="subsection", dtype=DataType.VARCHAR, max_length=256),
+                FieldSchema(name="clause", dtype=DataType.VARCHAR, max_length=256),
                 FieldSchema(name="citation", dtype=DataType.VARCHAR, max_length=256),
                 FieldSchema(name="char_count", dtype=DataType.INT64),
                 FieldSchema(
@@ -204,12 +199,29 @@ class MilvusVectorStore:
         except Exception as e:
             logger.warning("Milvus collection load failed (will still attempt queries): %s", e)
 
+    def _get_existing_embedding_dim(self) -> int:
+        if self._collection is None:
+            return 0
+
+        try:
+            for field in self._collection.schema.fields:
+                if field.name != "embedding":
+                    continue
+                params = getattr(field, "params", {}) or {}
+                dim = int(params.get("dim") or getattr(field, "dim", 0) or 0)
+                if dim > 0:
+                    return dim
+        except Exception as e:
+            logger.warning("Could not inspect Milvus embedding schema for %s: %s", self._config.collection, e)
+
+        return 0
+
     def _default_index_params(self) -> dict[str, Any]:
         if self._config.index_type == "HNSW":
             return {
                 "index_type": "HNSW",
                 "metric_type": self._config.metric,
-                "params": {"M": 16, "efConstruction": 200},
+                "params": {"M": 16, "efConstruction": 350},
             }
         if self._config.index_type == "IVF_FLAT":
             return {"index_type": "IVF_FLAT", "metric_type": self._config.metric, "params": {"nlist": 2048}}
@@ -219,7 +231,7 @@ class MilvusVectorStore:
 
     def _default_search_params(self) -> dict[str, Any]:
         if self._config.index_type == "HNSW":
-            return {"metric_type": self._config.metric, "params": {"ef": 64}}
+            return {"metric_type": self._config.metric, "params": {"ef": 128}}
         if self._config.index_type.startswith("IVF"):
             return {"metric_type": self._config.metric, "params": {"nprobe": 16}}
         return {"metric_type": self._config.metric, "params": {}}
@@ -422,12 +434,12 @@ class MilvusVectorStore:
             doc_type.append(str(m.get("doc_type") or ""))
             source.append(str(m.get("source") or ""))
             source_path.append(str(m.get("source_path") or ""))
-            act.append(str(m.get("act") or ""))
-            chapter.append(str(m.get("chapter") or ""))
-            section.append(str(m.get("section") or ""))
-            subsection.append(str(m.get("subsection") or ""))
-            clause.append(str(m.get("clause") or ""))
-            citation.append(str(m.get("citation") or ""))
+            act.append(str(m.get("act") or "")[:250])
+            chapter.append(str(m.get("chapter") or "")[:250])
+            section.append(str(m.get("section") or "")[:250])
+            subsection.append(str(m.get("subsection") or "")[:250])
+            clause.append(str(m.get("clause") or "")[:250])
+            citation.append(str(m.get("citation") or "")[:250])
             char_count.append(int(m.get("char_count") or len(text or "")))
             try:
                 metadata_json.append(json.dumps(m, ensure_ascii=False))

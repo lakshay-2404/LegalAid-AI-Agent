@@ -156,6 +156,7 @@ sequenceDiagram
 - `documentation_generator.py`: auto-doc generator for `docs/ARCHITECTURE.md` (kept separate from this manual doc).
 - `generation.py`: robust PDF/JSON -> Markdown converter (preprocessing tool for cleaner sources).
 - `main.py`: a simple CLI chat runner with a JSON cache.
+- `app_ui.py` and `app_utf8.py`: compatibility wrappers that both delegate to `app.py`.
 
 ### Folders
 - `pdfs/`: primary document sources used for ingestion (`.pdf`, `.md`, `.json`).
@@ -509,19 +510,28 @@ This prevents "dimension mismatch" failures when services restart or models are 
 
 ### Local deployment (Docker Compose)
 `infra/docker-compose.yml` runs:
+- the Streamlit app (`app.py`) in a Python container
 - Milvus standalone + dependencies (etcd, MinIO)
-- Attu UI for Milvus inspection
-- Neo4j for the graph layer
+- an optional local Neo4j container behind the `graph` profile
+- a one-shot ingestion container behind the `ingest` profile
 
 Typical local flow:
-1. Start services: `docker compose -f infra/docker-compose.yml --env-file infra/.env up -d`
-2. Run ingestion: `python ingestion_pipeline.py`
-3. Run app: `streamlit run app.py`
+1. Copy envs once: `Copy-Item infra/.env.example infra/.env`
+2. Start the app stack: `docker compose -f infra/docker-compose.yml --env-file infra/.env up -d --build`
+3. Open the UI at `http://localhost:8501`
+4. Run the clean ingestion job when needed: `docker compose -f infra/docker-compose.yml --env-file infra/.env --profile ingest up --build ingestion`
+5. Start the local Neo4j container only if you want a local graph backend: `docker compose -f infra/docker-compose.yml --env-file infra/.env --profile graph up -d neo4j`
+
+Operational note:
+- The app container defaults `OLLAMA_BASE_URL` to `http://host.docker.internal:11434`, so Ollama can keep running on the host machine while Milvus/UI run in Docker.
+- The compose file binds `../chrome_langchain_db` into the container so local and containerized runs share the same ingestion state.
 
 ### Environment variables
 See `infra/.env.example`. Key toggles:
 - `ENABLE_GRAPH=1` enables Neo4j writes + graph-augmented retrieval
 - `AUTO_DOCS=0` disables auto-regeneration of `docs/ARCHITECTURE.md`
+- `OLLAMA_BASE_URL=http://host.docker.internal:11434` points the containerized app to the host Ollama server
+- `STREAMLIT_PORT=8501` controls the exposed UI port
 
 ### Failure handling and degrade modes
 - If Milvus index creation fails, the system logs and continues (queries may be slower).
@@ -549,7 +559,7 @@ This script exists so the runtime system does not need a dependency on Chroma, b
 
 ## Known Gaps / Notes
 
-- `test_performance.py` references `vector.retriever`, which is not present in the current codebase; it likely predates the Milvus refactor.
+- `test_performance.py` is a lightweight operational check, not a formal benchmark suite.
 - Some files contain mojibake characters (e.g., `â€”`, `â€¦`) which typically indicates a UTF-8/CP1252 display mismatch. The core pipeline uses UTF-8 reads/writes and `ensure_ascii=False` for JSON where possible, but you may want to normalize file encodings in your editor/terminal for clean UI output.
 
 ## Suggested Next Hardening Steps (If You Move Toward Production)

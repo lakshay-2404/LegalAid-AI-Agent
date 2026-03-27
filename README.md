@@ -1,564 +1,512 @@
-# LegalAid-AI Agent - Technical Documentation (One-Time, Human Authored)
+﻿# LegalAid-AI Agent (NyayGram)
 
-This document explains what each part of the repository does, how the system works end-to-end, and why the major engineering choices were made. It is intentionally *not* auto-generated (unlike `docs/ARCHITECTURE.md`).
+Local-first hybrid Retrieval-Augmented Generation (RAG) system for Indian law. It combines semantic search (Milvus), lexical search (BM25), and an optional graph layer (Neo4j) to produce grounded answers with explicit citations.
 
 ## Table of Contents
-- Goals and Non-Goals
-- High-Level Architecture
-- Data Flows (Ingestion + Query)
-- Repository Tour
-- Module Deep Dive
-- Why These Technology Choices
-- Data Model
+- Overview
+- Quick Start
+- Architecture
+- Data Flows
+- Additional Diagrams
+- Repository Map
 - Ingestion Pipeline
-- Query Pipeline
-- Milvus Layer Details
-- Deployment and Operations
-- Migration Utilities (Chroma -> Milvus)
-- Known Gaps / Notes
-- Suggested Next Hardening Steps
+- Retrieval and Answering Pipeline
+- Data Model
+- Storage and State
+- Configuration
+- Deployment
+- Operations and Troubleshooting
+- Development Notes
 
-## Goals and Non-Goals
+## Overview
 
-### Goals
-- Provide a robust local-first Legal RAG system for Indian-law content.
-- Preserve source fidelity: answers should be grounded in retrieved context with explicit citations.
-- Scale ingestion/retrieval beyond what an embedded DB can comfortably handle.
-- Support structured metadata (Act/Section/etc.) for deterministic retrieval and filtering.
-- Keep the system operable on a single developer machine (Docker + Python).
+Core goals:
+- Ground answers in retrieved legal sources with explicit citations.
+- Support both exact statutory matching and semantic similarity.
+- Scale ingestion and retrieval beyond an embedded database.
+- Keep the system usable on a single developer machine.
 
-### Non-goals
-- This repository does not attempt to be a full legal expert system or provide legal advice.
-- This repository does not implement a full production observability stack (it provides hooks and sane logging, not dashboards).
+Core components:
+- Streamlit UI for chat and index operations.
+- Python orchestration layer for hybrid retrieval, reranking, and prompting.
+- Milvus vector store for semantic search and metadata filtering.
+- BM25 SQLite corpus for lexical recall.
+- Optional Neo4j graph for statute-aware retrieval.
 
-## High-Level Architecture
+Docs:
+- `docs/ARCHITECTURE.md` is auto-generated and updated by `documentation_generator.py` when `AUTO_DOCS=1`.
+- `docs/TECHNICAL_DOCUMENTATION.md` is a longer-form deep dive reference.
 
-The system is a Hybrid RAG:
-- **Vector layer (Milvus)**: semantic similarity search over chunk embeddings + server-side metadata filters.
-- **Lexical layer (BM25)**: keyword matching (strong for statutory phrases and exact terms).
-- **Graph layer (Neo4j, optional)**: structure-aware candidate generation (Act/Section neighborhood) to improve precision/recall for statute-heavy queries.
-- **Orchestration layer (Python)**: query analysis, hybrid retrieval, deterministic "knowledge injection", reranking, confidence scoring, context construction.
-- **LLM synthesis (Ollama)**: local generation constrained by a citation-first prompt contract.
-- **UI (Streamlit)**: interactive chat + controls to rebuild the index and inspect basic health.
+## Quick Start
+
+### Option A: Docker-backed stack (recommended)
+
+1. Copy the environment template:
+
+```powershell
+Copy-Item infra/.env.example infra/.env
+```
+
+2. Start the Docker stack (Milvus, Neo4j, and dependencies):
+
+```powershell
+docker compose -f infra/docker-compose.yml --env-file infra/.env up -d --build
+```
+
+3. Create a virtual environment and install dependencies:
+
+```powershell
+python -m venv venv
+venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+4. Run the app:
+
+```powershell
+streamlit run app.py
+```
+
+5. Optional: force ingestion explicitly:
+
+```powershell
+python ingestion_pipeline.py
+```
+
+### Option B: Use existing services
+
+1. Set your environment variables for Milvus and (optionally) Neo4j.
+2. Create a virtual environment and install dependencies.
+3. Run the app with `streamlit run app.py`.
+
+Notes:
+- The first query triggers ingestion automatically.
+- To run without Neo4j, leave `ENABLE_GRAPH=0` (default) and do not start the graph profile.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph UI[Streamlit]
-    st[app.py]
+  subgraph UI[User Interface]
+    ST[Streamlit app.py]
   end
 
-  subgraph PY[Python Orchestration]
-    rc[rag_core.py]
-    v[vector.py]
-    orch[orchestrator.py]
+  subgraph CORE[RAG Orchestration]
+    RC[rag_core.py]
+    V[vector.py]
+    R[retrieval.py]
+    ING[ingestion.py]
   end
 
-  subgraph VEC[Vector Store]
-    milvus[(Milvus)]
+  subgraph STORES[Stores]
+    MV[(Milvus Vector Store)]
+    BM[(BM25 SQLite)]
+    GS[(Neo4j Graph - optional)]
   end
 
-  subgraph LEX[Lexical Index]
-    bm25[(SQLite BM25 corpus)]
+  subgraph LLM[LLM Provider]
+    OLL[Ollama]
+    GRQ[Groq API (optional)]
   end
 
-  subgraph GRAPH[Graph Store - optional]
-    neo4j[(Neo4j)]
-  end
-
-  st --> rc --> v
-  rc --> orch
-  v --> milvus
-  v --> bm25
-  orch --> neo4j
-  orch --> milvus
+  ST --> RC
+  RC --> V
+  V --> R
+  V --> ING
+  ING --> MV
+  ING --> BM
+  ING --> GS
+  R --> MV
+  R --> BM
+  RC --> GS
+  RC --> OLL
+  RC -.-> GRQ
 ```
 
-## Data Flows (Ingestion + Query)
+## Data Flows
 
 ### Ingestion sequence
+
 ```mermaid
 sequenceDiagram
   participant CLI as ingestion_pipeline.py
-  participant V as vector.py
-  participant MV as Milvus (vector_store.py)
+  participant ING as ingestion.py
+  participant MV as Milvus
   participant BM as bm25.sqlite
-  participant G as Neo4j (graph_store.py)
-  participant D as documentation_generator.py
+  participant GS as Neo4j
+  participant DOC as documentation_generator.py
 
-  CLI->>V: ensure_ingested(force=...)
-  V->>V: discover_source_files()
+  CLI->>ING: ensure_ingested(force=...)
+  ING->>ING: discover_source_files()
   loop per source file
-    V->>V: compute_file_hash()
+    ING->>ING: compute_file_fingerprint()
     alt changed/new
-      V->>MV: delete_by_ids(old_doc_ids)
-      V->>BM: delete rows(old_doc_ids)
-      V->>G: delete_chunks(old_doc_ids) (if ENABLE_GRAPH=1)
-      loop streaming chunks
-        V->>MV: add_documents(batch)
-        V->>BM: INSERT OR REPLACE corpus
-        V->>G: upsert_chunks(batch) (optional)
+      ING->>MV: delete_by_ids(old_doc_ids)
+      ING->>BM: delete corpus rows
+      ING->>GS: delete_chunks(old_doc_ids) if ENABLE_GRAPH=1
+      loop chunk batches
+        ING->>MV: upsert_embeddings(batch)
+        ING->>BM: INSERT OR REPLACE corpus
+        ING->>GS: upsert_chunks(batch) if ENABLE_GRAPH=1
       end
-      V->>V: save_manifest()
+      ING->>ING: save_manifest()
     else unchanged
-      V->>V: skip
+      ING->>ING: skip
     end
   end
   opt AUTO_DOCS=1
-    CLI->>D: regenerate_docs_if_needed()
+    CLI->>DOC: regenerate_docs_if_needed()
   end
 ```
 
 ### Query sequence
+
 ```mermaid
 sequenceDiagram
   participant UI as app.py
   participant RC as rag_core.py
   participant V as vector.py
-  participant O as orchestrator.py
-  participant G as neo4j
-  participant MV as milvus
-  participant LLM as ollama
+  participant R as retrieval.py
+  participant MV as Milvus
+  participant BM as bm25.sqlite
+  participant GS as Neo4j
+  participant LLM as Ollama or Groq
 
   UI->>RC: answer_query(query, model)
   RC->>RC: preprocess + issue tagging
   RC->>V: hybrid_retrieve(query)
-  V->>MV: similarity_search_with_score()
-  V->>V: BM25 scoring (sqlite + BM25Okapi)
+  V->>R: vector + BM25 retrieval
+  R->>MV: similarity_search_with_score
+  R->>BM: BM25 scoring
   opt ENABLE_GRAPH=1
-    RC->>O: graph_vector_retrieve()
-    O->>G: candidate_doc_ids(act, sections)
-    O->>MV: similarity_search_with_score(filter=doc_id in [...])
+    RC->>GS: graph_vector_retrieve()
+    RC->>MV: filtered search by doc_id
   end
   RC->>RC: knowledge_layer_injections()
-  RC->>MV: get_docs(where=metadata filters)
-  RC->>V: rerank(docs)
   RC->>RC: build_context() + confidence
   RC->>LLM: model.invoke(prompt with [Source N] blocks)
   RC->>UI: answer + provenance + confidence
 ```
 
-## Repository Tour
+## Additional Diagrams
 
-### Top-level Python modules
-- `app.py`: Streamlit frontend (chat UI + index controls).
-- `rag_core.py`: the RAG pipeline (query analysis, retrieval orchestration, context building, prompting, confidence + provenance).
-- `vector.py`: ingestion + retrieval utilities:
-  - incremental ingestion manifest
-  - PDF/MD/JSON loaders and chunkers
-  - Milvus vector store initialization
-  - BM25 corpus persistence in SQLite
-  - optional Neo4j graph writes during ingestion
-  - hybrid retrieve (vector + BM25) and reranking
-- `vector_store.py`: Milvus adapter (pymilvus) exposing a Chroma-like filter interface to avoid breaking the rest of the pipeline.
-- `graph_store.py`: Neo4j adapter + minimal legal graph schema (Act/Section/Chunk and citation edges).
-- `orchestrator.py`: optional graph-augmented retrieval that restricts Milvus search to graph candidates.
-- `ingestion_pipeline.py`: CLI entrypoint to run ingestion and (optionally) regenerate the auto `docs/ARCHITECTURE.md`.
-- `documentation_generator.py`: auto-doc generator for `docs/ARCHITECTURE.md` (kept separate from this manual doc).
-- `generation.py`: robust PDF/JSON -> Markdown converter (preprocessing tool for cleaner sources).
-- `main.py`: a simple CLI chat runner with a JSON cache.
+### Graph Retrieval View (Optional)
 
-### Folders
-- `pdfs/`: primary document sources used for ingestion (`.pdf`, `.md`, `.json`).
-- `chrome_langchain_db/`: local persistent state:
-  - `ingest_manifest.json` tracks incremental ingestion by file hash
-  - `bm25.sqlite` stores the BM25 corpus texts + metadata
-  - `embed_dim.json` caches the embedding dimension probe
-- `infra/`: Docker Compose deployment for Milvus + Neo4j (+ Attu UI).
-- `scripts/`: one-off utilities (not part of the runtime serving path).
-- `docs/`: documentation (auto and manual).
+```mermaid
+flowchart LR
+  Q[User Query] --> TAG[Act/Section Extraction]
+  TAG -->|ENABLE_GRAPH=1| NEO[Neo4j Graph]
+  NEO --> CANDS[Candidate doc_id set]
+  CANDS -->|metadata filter| MV[Milvus Vector Search]
+  MV --> DOCS[Ranked chunks]
+  DOCS --> RC[rag_core build_context]
+  RC --> LLM[LLM answer]
+```
 
-## Module Deep Dive (What Each File Does and Why)
+### Deployment Topology
 
-### `app.py` (Streamlit UI)
-What it does:
-- Provides a chat UX (`st.chat_input`) and renders Q/A turns plus optional retrieved sources.
-- Exposes operational controls:
-  - "Rebuild Index" button calls `vector.rebuild_index()` (drops Milvus collection, resets manifest and BM25 corpus).
-  - "Index" panel shows `vector.index_status()` (count + errors).
-- Provides optional voice UX:
-  - Browser speech-to-text UI (manual copy/paste due to Streamlit component return limitations).
-  - Optional server-side transcription via OpenAI Whisper if `openai` is installed and `OPENAI_API_KEY` is present.
+```mermaid
+flowchart TB
+  subgraph HOST[Developer Machine]
+    UI[Browser UI]
+    APP[Streamlit app.py]
+    OLL[Ollama (host)]
+  end
 
-Why this shape:
-- Streamlit reruns make global state tricky; this UI delegates all persistence and concurrency to `vector.py` (locks + manifest).
-- The UI keeps the system operable without requiring a separate backend service.
+  subgraph DOCKER[Docker Compose Network]
+    MV[(Milvus)]
+    ETCD[(etcd)]
+    MINIO[(MinIO)]
+    NEO[(Neo4j - optional)]
+  end
 
-### `ingestion_pipeline.py` (CLI ingestion entrypoint)
-What it does:
-- Calls `vector.ensure_ingested(force=...)`.
-- Optionally sets `ENABLE_GRAPH=1` for the run (via a CLI flag).
-- Optionally regenerates the auto architecture doc (`docs/ARCHITECTURE.md`).
+  UI --> APP
+  APP --> MV
+  APP --> NEO
+  APP --> OLL
+  MV --> ETCD
+  MV --> MINIO
+```
 
-Why this exists:
-- Separates "operational ingestion" from the UI, so ingestion can be run in CI, scheduled jobs, or manual maintenance.
+### Storage Layout
 
-### `vector.py` (Ingestion + Retrieval Utilities)
-What it does:
-- Owns the "data plane" for documents:
-  - load and chunk `.pdf`, `.md`, `.json`
-  - infer metadata (Act/Chapter/Section/etc.)
-  - create stable `doc_id`s
-  - upsert to Milvus and update BM25 + graph (optional)
-  - maintain an incremental ingestion manifest
-- Owns hybrid retrieval:
-  - `hybrid_retrieve()` merges Milvus similarity and BM25 keyword hits
-  - `rerank()` adds authority-aware prioritization
+```mermaid
+flowchart TB
+  ROOT[Repository Root]
+  ROOT --> PDFS[pdfs/]
+  ROOT --> DB[chrome_langchain_db/]
+  DB --> MAN[ingest_manifest.json]
+  DB --> BM25[bm25.sqlite]
+  DB --> DIM[embed_dim.json]
+  ROOT --> LOGS[logs/]
+  ROOT --> DOCS[docs/]
+  ROOT --> INFRA[infra/]
+  INFRA --> ENV[.env]
+  INFRA --> COMPOSE[docker-compose.yml]
 
-Why it is centralized:
-- Streamlit's execution model and local-first goals favor a single module that owns ingestion state (manifest, BM25 corpus, vector store singleton, locks).
-- Keeping ingestion + retrieval in one place reduces schema drift across components.
+  VOLS[Docker Volumes]
+  VOLS --> MVDATA[milvus_data]
+  VOLS --> NEO4J[neo4j_data / neo4j_logs]
+```
 
-### `vector_store.py` (Milvus adapter)
-What it does:
-- Defines a Milvus schema that preserves `doc_id` as a primary key.
-- Converts a subset of Chroma-like filter dicts into Milvus expressions.
-- Provides the minimal methods the rest of the pipeline depends on:
-  - add/upsert with explicit embeddings (needed for migration)
-  - similarity search with metadata filters
-  - deterministic metadata queries (`get_docs`)
+### Configuration Resolution Flow
 
-Why a custom adapter:
-- The project previously depended on Chroma semantics; this layer keeps filters stable and avoids ripple changes in `rag_core.py`.
+```mermaid
+flowchart TD
+  START[Start app / ingestion]
+  START --> ENV[Read environment variables]
+  ENV --> CFG[Build config objects]
+  CFG -->|Milvus| MV[MilvusConfig.from_env]
+  CFG -->|Neo4j| NEO[Neo4jConfig.from_env]
+  CFG -->|LLM| LLM[OLLAMA_BASE_URL / DEFAULT_LLM_MODEL]
+  CFG -->|Ingestion| INGEST[INGEST_* tuning values]
+  MV --> VS[Vector store init]
+  NEO --> GS[Graph store init (if ENABLE_GRAPH=1)]
+  LLM --> UI[Model picker in Streamlit]
+  INGEST --> PIPE[Ingestion pipeline]
+```
 
-### `rag_core.py` (RAG orchestration)
-What it does:
-- Performs query analysis and routing:
-  - overview detection vs clause/enforceability vs general Q&A
-  - issue tagging, query expansion, and source boosts
-- Builds the retrieval pool via multiple stages:
-  - hybrid retrieval (vector + BM25)
-  - optional graph-augmented retrieval
-  - deterministic "knowledge injection" via metadata queries
-  - recall/rescue expansion when confidence is low
-- Applies dedup + rerank + strict context budgets, then runs LLM synthesis with a citation contract.
-- Computes and appends confidence/provenance to every answer.
+### Ingestion State and Lifecycle
 
-Why it is structured this way:
-- Legal RAG benefits from deterministic anchors (sections, Acts) layered on top of embeddings.
-- Precision-first reduces hallucinations; controlled expansion improves recall only when needed.
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Discovering : ensure_ingested()
+  Discovering --> Unchanged : manifest up-to-date
+  Discovering --> Deleting : file changed or removed
+  Deleting --> Inserting : remove old doc_ids
+  Inserting --> Saving : upsert batches
+  Saving --> Idle : save manifest
+  Unchanged --> Idle
+  Idle --> Rebuild : rebuild_index()
+  Rebuild --> Deleting
+```
 
-### `graph_store.py` and `orchestrator.py` (optional graph retrieval)
-What they do:
-- `graph_store.py` writes and queries Neo4j:
-  - Act/Section/Chunk nodes
-  - constraints for uniqueness
-  - heuristic `CITES` edges from section refs
-- `orchestrator.py` uses Neo4j to produce candidate `doc_id`s and restricts Milvus retrieval to that set when feasible.
+### Retrieval Scoring Funnel
 
-Why optional:
-- Graph databases add operational complexity. Making this path env-guarded keeps the system usable on vector-only deployments.
+```mermaid
+flowchart TB
+  Q[User Query] --> PRE[Preprocess + Issue Tagging]
+  PRE --> HYB[Hybrid Retrieve (Vector + BM25)]
+  HYB --> POOL[Candidate Pool]
+  POOL --> INJ[Knowledge-layer Injections]
+  INJ --> DEDUP[Deduplicate]
+  DEDUP --> RERANK[Authority-aware Rerank]
+  RERANK --> FILTER[Relevance Thresholds]
+  FILTER --> TOP[Top-K Context Docs]
+```
 
-### `generation.py` (PDF/JSON -> Markdown converter)
-What it does:
-- Converts noisy PDFs and JSON sources to clean Markdown for higher-quality ingestion.
-- Handles multilingual text and OCR with Hindi+English, plus header/footer stripping.
+### Prompt + Citation Contract Flow
 
-Why it is separated from ingestion:
-- Ingestion must be reliable and fast for frequent runs; heavy cleanup and OCR at conversion time can be performed offline and checked into `pdfs/` as `.md`.
+```mermaid
+flowchart LR
+  DOCS[Context Docs] --> CTX[Build [Source N] blocks]
+  CTX --> PROMPT[Select prompt template]
+  PROMPT --> LLM[LLM Generation]
+  LLM --> CHECK[Citation Hygiene Check]
+  CHECK --> OK[Answer + Confidence]
+  CHECK -->|Missing/weak citations| WARN[Add warning + lower confidence]
+```
 
-### `documentation_generator.py` (auto architecture doc)
-What it does:
-- Rebuilds `docs/ARCHITECTURE.md` from the current repo/config signature.
-- Avoids importing heavy runtime modules; reads embed dim from env or the local cache file.
+### Graph Candidate Expansion (Sequence)
 
-Why it exists:
-- Keeps a "living", code-synced architecture snapshot, while this manual document explains the deeper reasoning and trade-offs.
+```mermaid
+sequenceDiagram
+  participant RC as rag_core.py
+  participant GS as Neo4j
+  participant MV as Milvus
 
-### `scripts/migrate_chroma_to_milvus.py` (one-time migration utility)
-What it does:
-- Reads a persistent Chroma collection (ids, docs, metadatas, embeddings).
-- Writes those entries into Milvus while preserving:
-  - ids
-  - vectors (recomputed only if missing)
-  - metadata (including Unicode/Hindi)
-- Supports batch migration, retries, and a progress file for resumability.
+  RC->>GS: extract Act/Section, query graph candidates
+  GS-->>RC: candidate doc_ids
+  RC->>MV: similarity search with doc_id filter
+  MV-->>RC: filtered results
+  RC->>RC: merge into candidate pool
+```
 
-Why it exists:
-- Migration is operational, not part of serving. Keeping it in `scripts/` avoids runtime coupling to Chroma but still provides a safe path for historical data.
+### Error and Fallback Paths
 
-### `infra/docker-compose.yml` and `infra/.env.example` (local deployment)
-What they do:
-- Provide a reproducible local stack for Milvus (etcd + MinIO + Milvus standalone), optional Attu UI, and Neo4j.
-- Define environment variables for Python and container configuration.
+```mermaid
+flowchart TB
+  START[Answer query] --> ING[ensure_ingested()]
+  ING -->|Milvus error| MILVUS[Show Milvus help + stop]
+  ING -->|OK| RET[Retrieve + Build Context]
+  RET -->|No docs| FALLBACK[General knowledge fallback]
+  RET -->|Context OK| LLM[LLM Generation]
+  LLM -->|Ollama error + Groq available| GROQ[Groq fallback]
+  LLM -->|Citation issues| WARN[Warn + lower confidence]
+  LLM -->|OK| DONE[Return answer]
+```
 
-Why Docker Compose:
-- Keeps the system easy to run on a single machine while using production-like components (Milvus and Neo4j as real services).
+## Repository Map
 
-### `main.py` (minimal CLI runner)
-What it does:
-- Runs a terminal Q/A loop against `rag_core.answer_query()`.
-- Persists a simple `query_cache.json` with a 7-day TTL and basic cache hygiene.
+| Path | Purpose |
+| --- | --- |
+| `app.py` | Streamlit UI and user interaction flow. |
+| `rag_core.py` | Core RAG pipeline, context building, prompting, and confidence scoring. |
+| `vector.py` | Compatibility facade that re-exports ingestion and retrieval functions. |
+| `ingestion.py` | Incremental ingestion, manifest management, and BM25 updates. |
+| `retrieval.py` | Hybrid retrieval logic, reranking, and citation prompt helpers. |
+| `vector_store.py` | Milvus adapter with Chroma-like filter semantics. |
+| `graph_store.py` | Neo4j adapter and schema utilities. |
+| `orchestrator.py` | Optional graph-augmented retrieval. |
+| `embeddings.py` | Embedding providers and cross-encoder utilities. |
+| `chunking.py` | PDF/MD/JSON loading, chunking, and metadata extraction. |
+| `ingestion_pipeline.py` | CLI entrypoint for ingestion and optional docs regeneration. |
+| `documentation_generator.py` | Auto generator for `docs/ARCHITECTURE.md`. |
+| `generation.py` | Offline PDF/JSON to Markdown conversion tool. |
+| `main.py` | Lightweight CLI chat runner. |
+| `docs/ARCHITECTURE.md` | Auto-generated architecture snapshot. |
+| `docs/TECHNICAL_DOCUMENTATION.md` | Long-form technical reference. |
+| `infra/` | Docker Compose stack for Milvus, Neo4j, and the app. |
+| `scripts/` | One-off operational utilities. |
+| `pdfs/` | Source documents for ingestion. |
+| `chrome_langchain_db/` | Local state (manifest, BM25, embedding cache). |
 
-Why it exists:
-- Makes it easy to test retrieval/synthesis outside Streamlit and without a browser.
+## Ingestion Pipeline
 
-## Why These Technology Choices
+Ingestion is incremental and manifest-driven to avoid reprocessing unchanged sources.
 
-### Why Milvus (instead of Chroma)
-Milvus is chosen for better scaling and operational characteristics once you outgrow an embedded store:
-- richer index options (HNSW, IVF variants, auto-index)
-- durable persistence via external storage (MinIO + etcd in standalone compose)
-- more mature server-side filtering and search controls at larger corpus sizes
+Source discovery:
+- Files under `pdfs/` with extensions in `SUPPORTED_EXTENSIONS`.
+- Optional JSON datasets listed in `JSON_FILES` in `ingestion.py`.
 
-Trade-offs:
-- more services to run/monitor (Milvus depends on etcd + MinIO in this stack)
-- schema/index management becomes part of operations
+Manifest behavior:
+- The manifest is stored at `chrome_langchain_db/ingest_manifest.json`.
+- Each source file is tracked by a fingerprint and a list of generated `doc_id` values.
+- If a file changes, old `doc_id` values are deleted from Milvus, BM25, and Neo4j (if enabled) before reinsertion.
 
-### Why keep BM25 (hybrid retrieval)
-Legal queries often depend on exact statutory phrasing (e.g., "restraint of trade", "liquidated damages", "Section 27"), where lexical matching is strong.
+Chunking and metadata:
+- PDF, Markdown, JSON, and TXT inputs are normalized and chunked in `chunking.py`.
+- Regex-based extraction infers `act`, `section`, `chapter`, and related metadata.
 
-This repository keeps a BM25 layer:
-- to recover results that semantic embeddings miss (especially for short or jargon-heavy queries)
-- to provide deterministic keyword coverage even if vector search temporarily fails
+BM25:
+- A SQLite corpus is maintained at `chrome_langchain_db/bm25.sqlite` for lexical retrieval.
 
-BM25 is stored locally in SQLite for reliability and fast incremental updates (you do not want to rebuild BM25 by scanning Milvus on every run).
+Graph layer:
+- When `ENABLE_GRAPH=1`, chunks are written to Neo4j with Act, Section, and Chunk nodes.
+- Graph retrieval is optional and guarded at runtime.
 
-### Why Neo4j (optional graph layer)
-For statute-heavy questions, a graph helps constrain retrieval to:
-- the right Act
-- the right Section neighborhood
-- sections cited by the relevant sections (heuristic `CITES`)
+## Retrieval and Answering Pipeline
 
-The graph is **optional** and guarded by `ENABLE_GRAPH=1`. If Neo4j is down, the system degrades to vector+BM25 retrieval.
+Retrieval stages:
+- Hybrid search combines Milvus similarity search with BM25 lexical scoring.
+- Optional graph augmentation pulls candidate doc_ids from Neo4j and restricts Milvus search.
+- Knowledge-layer injections deterministically pull statutory sections by metadata.
+- Reranking prioritizes authoritative sources and query overlap.
 
-### Why a custom Milvus adapter (instead of only LangChain's wrapper)
-`vector_store.py` intentionally implements a minimal adapter with:
-- stable `doc_id` primary keys
-- Chroma-like `where` filters (`{"act":"..."}`, `{"$and":[...]}`, `{"field":{"$in":[...]}}`)
+Cross-encoder reranking (optional):
+- A sentence-transformers CrossEncoder re-scores `(query, doc)` pairs for higher precision ordering.
+- It runs after hybrid retrieval on the top candidate set and reorders results by relevance.
+- If the model or dependencies are missing, reranking is skipped without breaking the pipeline.
 
-This isolates the rest of the code from LangChain wrapper churn and preserves filter semantics during the migration.
+Answering:
+- Prompts enforce a strict citation contract using `[Source N]` blocks.
+- Overview queries use a broader prompt and retrieval strategy.
+- Clause enforceability queries use a dedicated prompt template.
+- Confidence scoring is computed from source quality, statutory coverage, and citation density.
 
 ## Data Model
 
-### Stable Document IDs
-During ingestion, each chunk gets a stable ID:
+Document IDs:
+- Each chunk ID is stable and includes the file path, chunk index, and hash prefix.
+- Example format: `relative_path:chunk_index:file_hash_prefix`.
 
-`doc_id = "{relative_path}:{chunk_index}:{file_hash_prefix}"`
+Milvus metadata fields:
+- `doc_id`, `text`, `doc_type`, `source`, `source_path`, `act`, `section`, `subsection`, `clause`, `citation`, `char_count`, `metadata_json`.
 
-This has two important properties:
-- it is stable for a specific file version and chunk position
-- if the file changes, the hash prefix changes, so new chunks do not collide with old chunks and the manifest-driven deletion path can cleanly remove prior content
+Neo4j graph schema:
 
-### Milvus Collection Schema
-The Milvus collection stores:
-- `doc_id` (primary key, VARCHAR)
-- `embedding` (FloatVector, dimension inferred and cached)
-- `text` (chunk text)
-- typed metadata fields for common filters: `doc_type`, `source`, `source_path`, `act`, `chapter`, `section`, `subsection`, `clause`, `citation`, `char_count`
-- `metadata_json` (full metadata JSON, to preserve forward compatibility and reduce schema churn)
+```mermaid
+erDiagram
+  ACT ||--o{ SECTION : HAS_SECTION
+  SECTION ||--o{ CHUNK : HAS_CHUNK
+  SECTION ||--o{ SECTION : CITES
 
-### Neo4j Graph Schema (superset for chunk-level retrieval)
-Nodes:
-- `(:Act {name})`
-- `(:Section {key, act, section, subsection, clause, citation})`
-- `(:Chunk {doc_id, source, source_path, doc_type, text})`
+  ACT {
+    string name
+  }
 
-Relationships:
-- `(Act)-[:HAS_SECTION]->(Section)`
-- `(Section)-[:HAS_CHUNK]->(Chunk)`
-- `(Section)-[:CITES]->(Section)` (heuristic extraction from chunk text)
+  SECTION {
+    string key
+    string act
+    string section
+    string subsection
+    string clause
+    string citation
+  }
 
-The graph exists to produce a candidate `doc_id` set for retrieval-time filtering; the final ranking and synthesis still happens in the RAG pipeline.
+  CHUNK {
+    string doc_id
+    string source
+    string source_path
+    string doc_type
+    string text
+  }
+```
 
-## Ingestion Pipeline (How Data Gets Into the System)
+## Storage and State
 
-### Source discovery
-`vector.py` ingests:
-- root JSON datasets listed in `JSON_FILES`
-- files under `pdfs/` with extensions in `SUPPORTED_EXTENSIONS = {".pdf", ".md", ".json"}`
+Local state directories:
+- `chrome_langchain_db/` stores the ingestion manifest, BM25 corpus, and embedding dimension cache.
+- `logs/` contains runtime logs and response traces.
 
-### Incremental ingestion via manifest
-The ingestion manifest (`chrome_langchain_db/ingest_manifest.json`) maps:
-- relative file path -> `hash` + list of produced `doc_id`s
+Container state:
+- Milvus persistence uses Docker volumes managed by the Compose stack.
+- Neo4j persistence is stored in Docker volumes when enabled.
 
-At ingest time:
-- compute file hash
-- if unchanged, skip
-- if changed, delete old `doc_id`s from Milvus, delete matching BM25 rows, delete matching Neo4j Chunk nodes (if enabled)
-- stream the file into chunks, batch insert into Milvus, update BM25 and graph in the same batches
+## Configuration
 
-This is designed to be memory-safe for large corpora and tolerant of partial failures.
+Common environment variables:
+- `MILVUS_HOST`, `MILVUS_PORT`, `MILVUS_COLLECTION`: Milvus connection and collection name.
+- `ENABLE_GRAPH`: set to `1` to enable Neo4j graph writes and graph retrieval.
+- `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`: Neo4j connection.
+- `OLLAMA_BASE_URL` or `OLLAMA_HOST`: Ollama API base URL.
+- `DEFAULT_LLM_MODEL`: default Ollama model name.
+- `DEFAULT_GROQ_MODEL`: default Groq model name.
+- `GROQ_API_KEY`: enable Groq responses if set.
+- `OPENAI_API_KEY`: optional, for audio transcription via Whisper.
+- `AUTO_DOCS`: set to `0` to disable auto-regeneration of `docs/ARCHITECTURE.md`.
+- `CROSS_ENCODER_MODEL`: cross-encoder model name (default: `cross-encoder/ms-marco-MiniLM-L-6-v2`).
+- `CROSS_ENCODER_DEVICE`: device for reranker (`cpu`, `cuda`, or `auto`).
+- `CROSS_ENCODER_BATCH_SIZE`: reranker batch size for scoring.
 
-### PDF ingestion and OCR fallback
-PDFs are first loaded via `PyPDFLoader` and normalized. If the text quality is poor (short text, low space ratio, suspicious average word length), OCR is attempted:
-- OCR uses `pdf2image` + `pytesseract`
-- OCR language pack: `eng+hin` (English + Hindi)
-- normalization runs after OCR to reduce common noise (missing spaces, hyphenation, weird artifacts)
+Ingestion tuning variables:
+- `INGEST_BATCH_SIZE`, `INGEST_INSERT_BATCH`, `INGEST_DOCS_PER_FLUSH`, `INGEST_FLUSH_STRATEGY`.
+- `INGEST_MANIFEST_SAVE_INTERVAL`, `INGEST_START_INDEX`, `INGEST_MAX_MEM_GB`.
 
-Operational note: OCR dependencies are intentionally *lazy-imported* so the system can still run even if OCR tooling is not installed.
+## Deployment
 
-### Markdown ingestion
-Markdown is read as UTF-8, stripped of code fences/backticks, normalized, and chunked. Basic heuristics convert numeric headings into `Section N` style anchors so that metadata extraction and retrieval behave more like statutes.
+Local Docker Compose stack:
 
-### JSON ingestion
-The JSON loader supports multiple shapes:
-- Q&A objects with `"question"` and `"answer"` (stored with `doc_type="qa"` and chunked using a Q&A-aware splitter)
-- CSV-in-JSON rows (a known dataset format)
-- a fallback mode that concatenates string-like values
+```powershell
+Copy-Item infra/.env.example infra/.env
 
-Metadata extraction uses regex heuristics to infer Act/Chapter/Section/Subsection/Clause/Citation.
+docker compose -f infra/docker-compose.yml --env-file infra/.env up -d --build
+```
 
-### Batch size and throughput
-Ingestion batches are intentionally conservative:
-- `BATCH_SIZE = 32` for embedding requests to avoid Ollama memory spikes.
+Ingestion container run:
 
-### Optional: Pre-clean sources with `generation.py`
-`generation.py` is a standalone preprocessing tool that converts `.pdf` and `.json` into cleaner `.md` while handling:
-- multilingual content (Unicode normalization, Hindi/English mixing)
-- header/footer removal (cross-page repetition detection)
-- OCR fallback and normalization
-- list/table reconstruction where possible
+```powershell
+docker compose -f infra/docker-compose.yml --env-file infra/.env --profile ingest up --build ingestion
+```
 
-This is recommended when your PDFs have heavy header/footer noise or scanned pages; cleaner Markdown improves chunking and retrieval quality.
+Enable Neo4j only when needed:
 
-## Query Pipeline (How Questions Become Answers)
+```powershell
+docker compose -f infra/docker-compose.yml --env-file infra/.env --profile graph up -d neo4j
+```
 
-The core query pipeline is `rag_core.answer_query()`. The design is "precision-first, then expand for recall" to reduce hallucinations and keep context grounded.
+## Operations and Troubleshooting
 
-### 1) Input validation and injection guardrails
-The query is validated (non-empty, max length). It also rejects obvious prompt injection patterns such as "ignore instruction" or "system prompt".
+Common issues:
+- Milvus unavailable: verify Docker Desktop is running and the Milvus containers are healthy.
+- Embedding dimension mismatch: set `EMBEDDING_DIM` or restart Ollama and rebuild the index.
+- Empty retrieval results: verify sources exist in `pdfs/` and that ingestion completed.
 
-### 2) Query type detection
-The system distinguishes:
-- **overview queries** ("what is", "overview", "summary", etc.)
-- **clause enforceability queries** ("is this clause legal/valid/enforceable?")
+Logs:
+- UI logs and response traces are written under `logs/`.
 
-These change retrieval breadth (`retrieval_k`) and the prompt template used for synthesis.
+## Development Notes
 
-### 3) Query preprocessing, tagging, and expansion
-The query is normalized and "issue tags" are detected (contract concepts, non-compete, arbitration, evidence, civil procedure, etc.). These tags drive:
-- query variants (a small set of high-signal paraphrases + statutory anchors)
-- source boosts (restricting retrieval to a likely Act/source file)
-- deterministic statute injections
-
-### 4) Retrieval stages
-Retrieval is a pool-building process:
-- **Base hybrid retrieval**: `vector.hybrid_retrieve()` merges Milvus similarity hits with BM25 hits and scores them (60% vector / 40% BM25).
-- **Graph-augmented retrieval (optional)**: if `ENABLE_GRAPH=1`, the orchestrator:
-  - extracts Act and section refs from the query
-  - asks Neo4j for candidate `doc_id`s
-  - runs Milvus search restricted to those candidates (when the candidate set is below a cap)
-  - backfills from global vector retrieval if the strict filter is too narrow
-- **Knowledge-layer injection**: deterministic fetching of specific sections by metadata, based on issue tags and explicit "Section N" references. This helps with statute recall when embeddings miss exact legal phrasing.
-- **Source-filtered retrieval**: additional recall by searching only within likely source files when needed.
-
-### 5) Relevance filtering, dedup, rerank
-The pipeline assigns a relevance score per document (phrase match + term coverage + citation hints), filters by a threshold, then:
-- ensures a minimum-size pool
-- deduplicates near-duplicates (doc_id or Jaccard similarity on tokens)
-- applies authority-aware reranking:
-  - statutes (pdf/md/json) generally outrank Q&A
-  - section-bearing chunks outrank vague chunks
-  - query token overlap adds relevance so "authority" does not dominate everything
-
-### 6) Context building with strict budgets
-Context is constructed as `[Source N: ...]` blocks with:
-- per-doc truncation (`MAX_DOC_CHARS`)
-- global context truncation (`MAX_CONTEXT_CHARS`, with a larger budget for overview queries)
-
-For overview queries, the context builder attempts to include:
-- definitional/structural sections (short title, extent, definitions, etc.)
-- early section numbers where possible (heuristic breadth)
-
-### 7) LLM synthesis (citation contract)
-The system uses different prompt templates depending on the query type (standard, clause enforceability, overview). The templates enforce:
-- "use ONLY the provided legal context"
-- citations after each paragraph using `[Source N]`
-- a strict "Not found in retrieved sources." response when evidence is missing
-
-After generation, the system checks citation hygiene:
-- if citations are missing, confidence is clamped and a warning is appended
-- if citations exist but are inconsistent, it appends a verification note
-
-### 8) Confidence scoring and provenance footer
-Confidence is a heuristic in `[0, 1]` based on:
-- how many statutory sources are present
-- whether section-level citations exist
-- whether multiple sources are present
-
-Every answer gets a footer:
-- provenance label (RAG vs general knowledge fallback)
-- qualitative confidence label (High/Medium/Limited/Low)
-
-## Milvus Layer Details
-
-### Indexing and search parameters
-Default choices are tuned for interactive latency:
-- Index: `HNSW` with `M=16`, `efConstruction=200`
-- Search: `ef=64` for HNSW
-
-These are solid defaults for small-to-medium corpora. For multi-million chunk corpora, IVF variants can be more memory-efficient but require tuning (`nlist`, `nprobe`).
-
-### Metadata filtering
-The adapter converts a subset of Chroma-style filters into Milvus expressions:
-- equality (`{"act": "Indian Contract Act"}`)
-- `$and` / `$or`
-- `$in` lists (used for `doc_id in [...]` filtering)
-
-Typed metadata fields exist for the most common filters, while `metadata_json` preserves everything else.
-
-### Embedding dimension handling
-Embedding dimension is handled robustly:
-- prefer cached `chrome_langchain_db/embed_dim.json`
-- else accept an explicit `EMBEDDING_DIM` env override
-- else probe the embedder once (`infer_embedding_dim()`), then cache it
-
-This prevents "dimension mismatch" failures when services restart or models are swapped.
-
-## Deployment and Operations
-
-### Local deployment (Docker Compose)
-`infra/docker-compose.yml` runs:
-- Milvus standalone + dependencies (etcd, MinIO)
-- Attu UI for Milvus inspection
-- Neo4j for the graph layer
-
-Typical local flow:
-1. Start services: `docker compose -f infra/docker-compose.yml --env-file infra/.env up -d`
-2. Run ingestion: `python ingestion_pipeline.py`
-3. Run app: `streamlit run app.py`
-
-### Environment variables
-See `infra/.env.example`. Key toggles:
-- `ENABLE_GRAPH=1` enables Neo4j writes + graph-augmented retrieval
-- `AUTO_DOCS=0` disables auto-regeneration of `docs/ARCHITECTURE.md`
-
-### Failure handling and degrade modes
-- If Milvus index creation fails, the system logs and continues (queries may be slower).
-- If Milvus search transiently fails, hybrid retrieval retries vector search and can fall back to BM25-only results.
-- If Neo4j is unavailable, graph retrieval is disabled and the system continues with vector+BM25.
-- If OCR dependencies are missing, PDF ingestion runs text-only and continues.
-
-### Persistence and backups
-- Milvus persistence is in Docker volumes (`milvus_data`, plus MinIO/etcd volumes).
-- Neo4j persistence is in Docker volumes (`neo4j_data`, `neo4j_logs`).
-- Local Python state is under `chrome_langchain_db/` (manifest, BM25, embedding dim cache).
-
-## Migration Utilities (Chroma -> Milvus)
-
-The migration utility is `scripts/migrate_chroma_to_milvus.py`. It:
-- reads a persistent Chroma collection
-- exports ids, embeddings, documents, metadata
-- inserts into Milvus while preserving:
-  - document IDs
-  - embeddings (recomputed only if missing)
-  - metadata (including Unicode)
-- supports retry logic and a progress file for resumability
-
-This script exists so the runtime system does not need a dependency on Chroma, but the repository currently retains the dependency for migration and compatibility.
-
-## Known Gaps / Notes
-
-- `test_performance.py` references `vector.retriever`, which is not present in the current codebase; it likely predates the Milvus refactor.
-- Some files contain mojibake characters (e.g., `â€”`, `â€¦`) which typically indicates a UTF-8/CP1252 display mismatch. The core pipeline uses UTF-8 reads/writes and `ensure_ascii=False` for JSON where possible, but you may want to normalize file encodings in your editor/terminal for clean UI output.
-
-## Suggested Next Hardening Steps (If You Move Toward Production)
-
-- Add structured configuration (pydantic settings) and a single config module to avoid env var drift.
-- Add a "readiness check" endpoint for Milvus/Neo4j/Ollama.
-- Add unit tests for:
-  - manifest-based incremental ingestion behavior
-  - `_dict_to_expr()` filter translation
-  - rag_core citation hygiene utilities
-- Add a background ingestion job + queue if ingestion becomes frequent.
-- Add proper secrets management (do not pass DB passwords as plain env vars in real deployments).
+Performance checks:
+- `test_performance.py` provides a lightweight operational check for retrieval speed.

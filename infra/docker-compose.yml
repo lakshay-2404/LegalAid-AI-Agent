@@ -1,87 +1,204 @@
-version: "3.9"
+x-runtime-env: &runtime-env
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+  DEFAULT_LLM_MODEL: ${DEFAULT_LLM_MODEL:-qwen2.5:3b}
+  MILVUS_HOST: milvus
+  MILVUS_PORT: "19530"
+  MILVUS_COLLECTION: ${MILVUS_COLLECTION:-indian_legal_rag}
+  MILVUS_INDEX_TYPE: ${MILVUS_INDEX_TYPE:-HNSW}
+  MILVUS_METRIC: ${MILVUS_METRIC:-COSINE}
+  OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+  OLLAMA_EMBED_NUM_CTX: ${OLLAMA_EMBED_NUM_CTX:-2048}
+  OLLAMA_EMBED_TIMEOUT_S: ${OLLAMA_EMBED_TIMEOUT_S:-60}
+  USE_ST_EMBED: ${USE_ST_EMBED:-1}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+  ST_EMBED_MODEL: ${ST_EMBED_MODEL:-BAAI/bge-base-en-v1.5}
+  ST_BATCH_SIZE: ${ST_BATCH_SIZE:-32}
+  ST_DEVICE: ${ST_DEVICE:-cuda}
+  CROSS_ENCODER_DEVICE: ${CROSS_ENCODER_DEVICE:-cuda}
+  USE_TORCH: ${USE_TORCH:-1}
+  USE_TF: ${USE_TF:-0}
+  TRANSFORMERS_NO_TF: ${TRANSFORMERS_NO_TF:-1}
+  INGEST_BATCH_SIZE: ${INGEST_BATCH_SIZE:-64}
+  INGEST_WORKERS: ${INGEST_WORKERS:-4}
+  INGEST_FLUSH_STRATEGY: ${INGEST_FLUSH_STRATEGY:-batch}
+  INGEST_INSERT_BATCH: ${INGEST_INSERT_BATCH:-256}
+  INGEST_DOCS_PER_FLUSH: ${INGEST_DOCS_PER_FLUSH:-256}
+  INGEST_MANIFEST_SAVE_INTERVAL: ${INGEST_MANIFEST_SAVE_INTERVAL:-25}
+  INGEST_MAX_MEM_GB: ${INGEST_MAX_MEM_GB:-8}
+  INGEST_MAX_CHARS: ${INGEST_MAX_CHARS:-4000}
+  INGEST_FILES_PER_FLUSH: ${INGEST_FILES_PER_FLUSH:-256}
+  INGEST_START_INDEX: ${INGEST_START_INDEX:-0}
+  ENABLE_GRAPH: ${ENABLE_GRAPH:-0}
+  NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+  NEO4J_USER: ${NEO4J_USER:-neo4j}
+  NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_password}
+  NEO4J_DATABASE: ${NEO4J_DATABASE:-}
+  EMBED_DOC_INSTRUCTION: "${EMBED_DOC_INSTRUCTION:-Represent this legal document for retrieval of relevant statutes and case law: }"
+  EMBED_QUERY_INSTRUCTION: "${EMBED_QUERY_INSTRUCTION:-Represent this legal query for retrieving relevant statutes and legal precedents: }"
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  DEFAULT_GROQ_MODEL: ${DEFAULT_GROQ_MODEL:-qwen/qwen3-32b}
+  HF_HUB_ENABLE_HF_TRANSFER: ${HF_HUB_ENABLE_HF_TRANSFER:-1}
+  HF_TOKEN: ${HF_TOKEN:-}
+  HUGGINGFACEHUB_API_TOKEN: ${HUGGINGFACEHUB_API_TOKEN:-}
+  HUGGINGFACE_HUB_TOKEN: ${HUGGINGFACE_HUB_TOKEN:-}
+  AUTO_DOCS: ${AUTO_DOCS:-0}
+  APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+  APP_LOG_MODE: ${APP_LOG_MODE:-stdout}
+  APP_LOG_JSON: ${APP_LOG_JSON:-true}
+  APP_LOG_MAX_BYTES: ${APP_LOG_MAX_BYTES:-1000000}
+  APP_LOG_BACKUP_COUNT: ${APP_LOG_BACKUP_COUNT:-3}
+  NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+  NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+  STREAMLIT_SERVER_ENABLE_WEBSOCKET_COMPRESSION: "false"
+  STREAMLIT_SERVER_HEADLESS: "true"
+  STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+  STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
 
 services:
-  # -------------------------
-  # Milvus (standalone)
-  # -------------------------
-  milvus-etcd:
-    image: quay.io/coreos/etcd:v3.5.5
-    container_name: milvus-etcd
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.14
+    container_name: legalaid-etcd
+    restart: unless-stopped
     environment:
-      - ETCD_AUTO_COMPACTION_MODE=revision
-      - ETCD_AUTO_COMPACTION_RETENTION=1000
-      - ETCD_QUOTA_BACKEND_BYTES=4294967296
-    command: >
-      etcd
-      -advertise-client-urls=http://0.0.0.0:2379
-      -listen-client-urls=http://0.0.0.0:2379
-      --data-dir=/etcd
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
     volumes:
-      - milvus_etcd:/etcd
+      - etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  milvus-minio:
-    image: minio/minio:RELEASE.2024-02-17T01-15-57Z
-    container_name: milvus-minio
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: legalaid-minio
+    restart: unless-stopped
     environment:
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
     command: minio server /minio_data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
     volumes:
-      - milvus_minio:/minio_data
+      - minio_data:/minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   milvus:
-    image: milvusdb/milvus:v2.4.4
-    container_name: milvus
+    image: milvusdb/milvus:v2.4.17
+    container_name: legalaid-milvus
+    restart: unless-stopped
     command: ["milvus", "run", "standalone"]
-    environment:
-      - ETCD_ENDPOINTS=milvus-etcd:2379
-      - MINIO_ADDRESS=milvus-minio:9000
+    cpus: "${MILVUS_CPU_LIMIT:-2}"
+    mem_limit: "${MILVUS_MEM_LIMIT:-4g}"
     ports:
-      - "19530:19530"   # gRPC
-      - "9091:9091"     # HTTP (metrics/health)
-    depends_on:
-      - milvus-etcd
-      - milvus-minio
+      - "19530:19530"
+      - "9091:9091"
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MILVUS_CACHE_SIZE: ${MILVUS_CACHE_SIZE:-1GB}
     volumes:
       - milvus_data:/var/lib/milvus
-
-  # Optional: Milvus UI (Attu)
-  attu:
-    image: zilliz/attu:v2.4.8
-    container_name: attu
-    environment:
-      - MILVUS_URL=milvus:19530
-    ports:
-      - "3000:3000"
     depends_on:
-      - milvus
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
 
-  # -------------------------
-  # Neo4j (graph database)
-  # -------------------------
   neo4j:
-    image: neo4j:5.20
-    container_name: neo4j
-    environment:
-      - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/neo4j_password}
-      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
-      - NEO4J_dbms_security_procedures_allowlist=apoc.*
-      - NEO4J_server_memory_pagecache_size=1G
-      - NEO4J_server_memory_heap_initial__size=1G
-      - NEO4J_server_memory_heap_max__size=2G
+    image: neo4j:5.20-community
+    container_name: legalaid-neo4j
+    restart: unless-stopped
+    profiles: ["graph"]
     ports:
-      - "7474:7474"   # HTTP
-      - "7687:7687"   # Bolt
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: ${LOCAL_NEO4J_AUTH:-neo4j/neo4j_password}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-256m}
+      NEO4J_dbms_memory_heap_max__size: ${NEO4J_HEAP_MAX:-512m}
+      NEO4J_dbms_memory_pagecache_size: ${NEO4J_PAGECACHE_SIZE:-256m}
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7474"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: legalaid-app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    gpus: all
+    environment:
+      <<: *runtime-env
+    env_file:
+      - .env
+    volumes:
+      - ../chrome_langchain_db:/app/chrome_langchain_db
+      - ../pdfs:/app/pdfs
+      - ../logs:/app/logs
+    depends_on:
+      milvus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 12
+      start_period: 600s
+
+  ingestion:
+    image: legalaid-ingestion:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: legalaid-ingestion
+    restart: "no"
+    profiles: ["ingest"]
+    gpus: all
+    command: >
+      sh -c "python -u ingestion_pipeline.py --force --no-docs --log-level INFO 2>&1 | tee /app/logs/ingest_groq.log"
+    environment:
+      <<: *runtime-env
+      PYTHONUNBUFFERED: "1"
+    env_file:
+      - .env
+    volumes:
+      - ../chrome_langchain_db:/app/chrome_langchain_db
+      - ../pdfs:/app/pdfs
+      - ../logs:/app/logs
+    depends_on:
+      milvus:
+        condition: service_healthy
 
 volumes:
-  milvus_etcd:
-  milvus_minio:
+  etcd_data:
+  minio_data:
   milvus_data:
   neo4j_data:
   neo4j_logs:

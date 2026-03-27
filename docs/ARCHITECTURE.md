@@ -52,7 +52,7 @@ Local Docker Compose: `infra/docker-compose.yml` brings up:
 
 Collection: `indian_legal_rag`
 - Primary key: `doc_id` (stable IDs preserved)
-- Vector: `embedding` (FloatVector, dim=(auto-detected at runtime), metric=COSINE)
+- Vector: `embedding` (FloatVector, dim=768, metric=COSINE)
 - Payload: `text` + core metadata fields (`act`, `section`, `doc_type`, `source`, etc.)
 - Full metadata preserved in `metadata_json` for forward compatibility
 

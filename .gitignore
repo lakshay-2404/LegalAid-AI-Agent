@@ -54,6 +54,23 @@ tmp/
 temp/
 _tmp_mdgen/
 docs/.autogen_state.json
+.docker_tmp/
+mdgen_spool_*/
+_tmp_*
+tmp_compose.yml
+*.err
+ingest_*.txt
+logs/
+infra/chrome_langchain_db/
+infra/pdfs/
+
+# =========================
+# Local workflow files
+# =========================
+tasks/todo.md
+tasks/lessons.md
+codex.local.md
+.codex.local.md
 
 # =========================
 # Test artifacts

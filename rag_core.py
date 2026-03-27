@@ -1,4 +1,5 @@
 from typing import List, Tuple
+from functools import lru_cache
 import hashlib
 import os
 import re
@@ -10,6 +11,8 @@ from langchain_ollama.llms import OllamaLLM
 # vector store (from Streamlit) is reflected everywhere.
 import vector
 # from vector import hybrid_retrieve, rerank, vector_store  # previous import style (kept for reference)
+from embeddings import cross_encoder_score
+from parent_expansion import reconstruct_sections
 
 STOPWORDS = {
     # Generic question scaffolding
@@ -26,8 +29,128 @@ PDF_DIR = Path(__file__).parent / "pdfs"
 # Guardrails to prevent extremely large prompts that can make local models appear to
 # "think forever". These are character-based (cheap) approximations.
 MAX_DOC_CHARS = 2400
-MAX_CONTEXT_CHARS = 18000
-MAX_CONTEXT_CHARS_OVERVIEW = 26000
+MAX_CONTEXT_CHARS = 12000
+MAX_CONTEXT_CHARS_OVERVIEW = 16000
+OVERVIEW_SECTION_WINDOW = 40
+OVERVIEW_METADATA_FETCH_LIMIT = 80
+OVERVIEW_OUTLINE_DOC_LIMIT = 30
+OVERVIEW_STRUCTURAL_KEYWORDS = [
+    "short title", "extent", "commencement", "application",
+    "definitions", "interpretation",
+    "contract", "agreement", "consideration", "proposal", "acceptance",
+    "competent", "free consent", "void", "voidable", "unlawful",
+    "performance", "breach", "damages", "compensation", "remedy",
+    "indemnity", "guarantee",
+]
+
+
+def _overview_section_ids(window: int = OVERVIEW_SECTION_WINDOW) -> list[str]:
+    return [str(i) for i in range(1, window + 1)]
+
+
+def _overview_query_terms(query: str | None) -> list[str]:
+    if not query:
+        return []
+    return [t for t in re.split(r"[^a-z0-9]+", query.lower()) if len(t) > 2 and t not in STOPWORDS]
+
+
+def _section_num(doc: Document) -> int:
+    s = doc.metadata.get("section")
+    try:
+        return int(str(s).strip())
+    except Exception:
+        return 10**9
+
+
+def _overview_outline_score(doc: Document, query_terms: list[str] | None = None) -> int:
+    txt = doc.page_content.lower()
+    score = 0
+    for kw in OVERVIEW_STRUCTURAL_KEYWORDS:
+        if kw in txt:
+            score += 3
+    for t in (query_terms or []):
+        if t in txt:
+            score += 2
+    n = _section_num(doc)
+    if n < 20:
+        score += 4
+    if n < 10:
+        score += 3
+    return score
+
+
+def _rank_overview_docs(docs: List[Document], query: str | None = None, limit: int = OVERVIEW_OUTLINE_DOC_LIMIT) -> List[Document]:
+    if not docs:
+        return []
+    q_terms = _overview_query_terms(query)
+    ranked = sorted(
+        deduplicate_docs(docs, similarity_threshold=None),
+        key=lambda d: (_overview_outline_score(d, q_terms), -len(d.page_content)),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+@lru_cache(maxsize=8)
+def _source_file_inventory(signature: tuple[str, ...]) -> tuple[tuple[str, str, frozenset[str]], ...]:
+    inventory: list[tuple[str, str, frozenset[str]]] = []
+    for name in signature:
+        stem = Path(name).stem
+        normalized = re.sub(r"[^a-z0-9]+", " ", stem.lower()).strip()
+        tokens = frozenset(t for t in normalized.split() if len(t) > 2 and t not in STOPWORDS)
+        inventory.append((name, normalized, tokens))
+    return tuple(inventory)
+
+
+@lru_cache(maxsize=4)
+def _source_inventory_for_dir_mtime(_dir_mtime_ns: int) -> tuple[tuple[str, str, frozenset[str]], ...]:
+    names = tuple(
+        sorted(
+            (
+                p.name
+                for p in list(PDF_DIR.glob("*.md")) + list(PDF_DIR.glob("*.json")) + list(PDF_DIR.glob("*.pdf"))
+            ),
+            key=str.lower,
+        )
+    )
+    return _source_file_inventory(names)
+
+
+def _current_source_inventory() -> tuple[tuple[str, str, frozenset[str]], ...]:
+    if not PDF_DIR.exists():
+        return tuple()
+
+    try:
+        dir_mtime_ns = PDF_DIR.stat().st_mtime_ns
+    except OSError:
+        return tuple()
+    return _source_inventory_for_dir_mtime(dir_mtime_ns)
+
+
+def _fetch_overview_scope_docs(where: dict, query: str, limit: int = OVERVIEW_OUTLINE_DOC_LIMIT) -> List[Document]:
+    candidates: List[Document] = []
+
+    # Pull likely structural sections first instead of fetching the whole Act/source corpus.
+    early_sections = _collection_get_docs(
+        {"$and": [where, {"section": {"$in": _overview_section_ids()}}]},
+        limit=min(OVERVIEW_METADATA_FETCH_LIMIT, max(limit * 2, 40)),
+    )
+    if early_sections:
+        candidates.extend(early_sections)
+
+    # Some preambles/headings do not parse into section metadata; keep a small sample of those too.
+    sectionless = _collection_get_docs(
+        {"$and": [where, {"section": ""}]},
+        limit=min(24, max(8, limit // 2)),
+    )
+    if sectionless:
+        candidates.extend(sectionless)
+
+    # Small fallback sample for Acts whose useful chunks are not captured by the above filters.
+    if len(candidates) < limit:
+        candidates.extend(_collection_get_docs(where, limit=min(OVERVIEW_METADATA_FETCH_LIMIT, max(limit * 2, 50))))
+
+    return _rank_overview_docs(candidates, query=query, limit=limit)
 
 def preprocess_query(query: str) -> str:
     """
@@ -125,13 +248,15 @@ PROMPT_TEMPLATE = """You are a legal information assistant specializing in India
 PRIORITY: Accuracy and source fidelity. Use ONLY the provided legal context.
 
 RULES:
-1. Do not add facts not supported by the sources.
+1. Do not add facts not supported by the sources. NEVER fabricate legal provisions, section numbers, or case names.
 2. If the sources do not contain the answer, respond exactly: "Not found in retrieved sources."
-3. Cite sources after EACH paragraph using the exact format: [Source N]
+3. Write the answer in English.
+4. Cite sources after EACH paragraph using the exact format: [Source N]
    - Use only the source number (do not invent citations).
    - If you cannot cite a claim, omit it.
-4. Distinguish statutory provisions from case law when relevant.
-5. If sources conflict, state the conflict and cite both.
+5. Distinguish statutory provisions from case law when relevant.
+6. If sources conflict, state the conflict and cite both.
+7. If you are unsure about any detail, say so explicitly rather than guessing.
 
 LEGAL CONTEXT (prioritized by relevance):
 {context}
@@ -147,16 +272,18 @@ CLAUSE_PROMPT_TEMPLATE = """You are a legal information assistant specializing i
 PRIORITY: Accuracy and source fidelity. Use ONLY the provided legal context.
 
 RULES:
-1. Do not add facts not supported by the sources.
+1. Do not add facts not supported by the sources. NEVER fabricate legal provisions, section numbers, or case names.
 2. If the sources do not contain any rule relevant to assessing the clause, respond exactly: "Not found in retrieved sources."
-3. Cite sources after EACH paragraph using the exact format: [Source N]
+3. Write the answer in English.
+4. Cite sources after EACH paragraph using the exact format: [Source N]
    - Use only the source number (do not invent citations).
    - If you cannot cite a claim, omit it.
-4. For questions about whether a contract/employment clause is "allowed", "valid", or "enforceable":
+5. For questions about whether a contract/employment clause is "allowed", "valid", or "enforceable":
    - Identify the relevant provision(s) in the context.
    - Explain what they say in plain language.
    - Apply them to the clause described in the question and state the conclusion.
    - Mention exceptions only if they appear in the context.
+6. If you are unsure about any detail, say so explicitly rather than guessing.
 
 LEGAL CONTEXT (prioritized by relevance):
 {context}
@@ -172,21 +299,23 @@ OVERVIEW_PROMPT_TEMPLATE = """You are a legal information assistant specializing
 PRIORITY: Accuracy and source fidelity. Use ONLY the provided legal context.
 
 RULES:
-1. Do not add facts not supported by the sources.
+1. Do not add facts not supported by the sources. NEVER fabricate legal provisions, section numbers, or case names.
 2. If the context does not identify the Act/topic at all, respond exactly: "Not found in retrieved sources."
-3. Cite sources after EACH paragraph using the exact format: [Source N]
+3. Write the answer in English.
+4. Cite sources after EACH paragraph using the exact format: [Source N]
    - Use only the source number (do not invent citations).
    - If you cannot cite a claim, omit it.
-4. Distinguish statutory provisions from case law examples.
-5. If the question is "What is <Act>?" provide a HOLISTIC overview, not just a few sections:
+5. Distinguish statutory provisions from case law examples.
+6. If the question is "What is <Act>?" provide a HOLISTIC overview, not just a few sections:
    - What the Act governs (scope/purpose)
    - Who/what it applies to (applicability)
    - Core concepts and definitions (as available)
    - Formation/validity framework (as available)
    - Performance/breach/remedies framework (as available)
    - A short list of key sections (only those present in sources)
-6. Organize clearly using headings: What It Is, Scope, Key Concepts, Key Sections, Practical Notes, Sources Used.
-7. For scope/purpose: do NOT guess. Derive it from the sections/headings present in context and cite those sections.
+7. Organize clearly using headings: What It Is, Scope, Key Concepts, Key Sections, Practical Notes, Sources Used.
+8. For scope/purpose: do NOT guess. Derive it from the sections/headings present in context and cite those sections.
+9. If you are unsure about any detail, say so explicitly rather than guessing.
 
 LEGAL CONTEXT (prioritized by relevance):
 {context}
@@ -200,6 +329,7 @@ ANSWER:
 FALLBACK_PROMPT_TEMPLATE = """Provide a concise general-information answer based on your own knowledge.
 You MUST:
 - Start with: "Not found in retrieved sources."
+- Write the answer in English.
 - Clearly label the answer as "General knowledge (not from RAG)".
 - Avoid citing sources.
 - End with: "Confidence: Low. Please verify with official legal sources."
@@ -322,25 +452,15 @@ def detect_target_source_file(query: str) -> str | None:
     from difflib import SequenceMatcher
 
     best = (0.0, None)
-    # Prefer .md/.json sources (cleaner than OCR PDFs) but include PDFs too so
-    # Acts that only exist as PDFs can still be matched.
-    candidates = (
-        sorted(PDF_DIR.glob("*.md"))
-        + sorted(PDF_DIR.glob("*.json"))
-        + sorted(PDF_DIR.glob("*.pdf"))
-    )
-
-    for p in candidates:
-        name = re.sub(r"[^a-z0-9]+", " ", p.stem.lower()).strip()
-        name_tokens = {t for t in name.split() if len(t) > 2 and t not in STOPWORDS}
+    for file_name, normalized_name, name_tokens in _current_source_inventory():
         if not name_tokens:
             continue
 
         overlap = len(q_tokens & name_tokens) / max(1, len(name_tokens))
-        ratio = SequenceMatcher(None, q, name).ratio()
+        ratio = SequenceMatcher(None, q, normalized_name).ratio()
         score = (overlap * 0.7) + (ratio * 0.3)
         if score > best[0]:
-            best = (score, p.name)
+            best = (score, file_name)
 
     return best[1] if best[0] >= 0.35 else None
 
@@ -685,8 +805,22 @@ def knowledge_layer_injections(
         if len(capped) >= max_sections_total:
             break
 
+    sections_by_source: dict[str, list[str]] = {}
     for src, sec in capped:
-        injected.extend(_collection_get_docs({"source": src, "section": sec}, limit=6))
+        sections_by_source.setdefault(src, []).append(sec)
+
+    for src, secs in sections_by_source.items():
+        unique_secs = list(dict.fromkeys(secs))
+        if len(unique_secs) == 1:
+            injected.extend(_collection_get_docs({"source": src, "section": unique_secs[0]}, limit=6))
+            continue
+
+        injected.extend(
+            _collection_get_docs(
+                {"$and": [{"source": src}, {"section": {"$in": unique_secs}}]},
+                limit=min(24, max(6, len(unique_secs) * 4)),
+            )
+        )
 
     return injected
 
@@ -1009,6 +1143,45 @@ def fallback_answer(query: str, model: OllamaLLM) -> str:
     return model.invoke(prompt)
 
 
+def translate_answer(answer: str, target_language: str, model: OllamaLLM) -> str:
+    """
+    Translate the final answer after synthesis while preserving citation markers and formatting.
+    Falls back to the original answer if the translation drops citations.
+    """
+    language = " ".join((target_language or "").split())
+    if not answer or not language or language.lower() in {"english", "en"}:
+        return answer
+
+    prompt = f"""You are a precise legal translator.
+
+Translate the ANSWER into {language}.
+
+Rules:
+1. Preserve meaning exactly. Do not add, remove, or reinterpret legal content.
+2. Preserve every citation marker like [Source 1] exactly as written.
+3. Preserve markdown structure, headings, bullets, numbering, line breaks, and the --- divider.
+4. Translate explanatory text after labels such as "Provenance:" and "Confidence:", but keep the labels themselves in English.
+5. Return only the translated answer.
+
+ANSWER:
+{answer}
+
+TRANSLATED ANSWER:
+"""
+
+    translated = (model.invoke(prompt) or "").strip()
+    if not translated:
+        return answer
+
+    source_markers = re.findall(r"\[Source\s+\d+\]", answer)
+    if source_markers:
+        translated_markers = re.findall(r"\[Source\s+\d+\]", translated)
+        if len(translated_markers) < len(source_markers):
+            return answer
+
+    return translated
+
+
 def annotate_answer(answer: str, confidence: float, provenance: str) -> str:
     """
     Always add a provenance/confidence footer for user trust.
@@ -1073,46 +1246,10 @@ def build_context(
         if act_statutory:
             statutory = act_statutory
 
-        keywords = [
-            "short title", "extent", "commencement", "application",
-            "definitions", "interpretation",
-            "contract", "agreement", "consideration", "proposal", "acceptance",
-            "competent", "free consent", "void", "voidable", "unlawful",
-            "performance", "breach", "damages", "compensation", "remedy",
-            "indemnity", "guarantee",
-        ]
-
-        q_terms = []
-        if query:
-            q_terms = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if len(t) > 2 and t not in STOPWORDS]
-
-        def section_num(d: Document) -> int:
-            s = d.metadata.get("section")
-            try:
-                return int(str(s).strip())
-            except Exception:
-                return 10**9
-
-        def overview_score(d: Document) -> int:
-            txt = d.page_content.lower()
-            score = 0
-            for kw in keywords:
-                if kw in txt:
-                    score += 5
-            for t in q_terms:
-                if t in txt:
-                    score += 2
-            # Prefer early, structural sections if we can parse them.
-            n = section_num(d)
-            if n < 50:
-                score += 3
-            if n < 10:
-                score += 3
-            return score
-
         # Pick a mix: high-signal sections + early structural sections for breadth.
-        ranked = sorted(statutory, key=lambda d: (overview_score(d), -len(d.page_content)), reverse=True)
-        early = sorted(statutory, key=lambda d: (d.metadata.get("section") is None, section_num(d)))
+        q_terms = _overview_query_terms(query)
+        ranked = sorted(statutory, key=lambda d: (_overview_outline_score(d, q_terms), -len(d.page_content)), reverse=True)
+        early = sorted(statutory, key=lambda d: (d.metadata.get("section") is None, _section_num(d)))
 
         chosen: List[Document] = []
         seen = set()
@@ -1274,9 +1411,81 @@ def answer_query(
                 doc_relevance[doc_id] = max(doc_relevance[doc_id], score)
 
     def merge_results(q: str) -> None:
-        merge_docs(vector.hybrid_retrieve(q, k=retrieval_k), q)
+        merge_docs(
+            vector.hybrid_retrieve(
+                q,
+                k=retrieval_k,
+                use_mmr=True,
+                mmr_lambda=0.7,
+                fetch_k=max(retrieval_k * 5, 50),
+                mmr_section_penalty=0.2,
+                mmr_case_penalty=0.1,
+                use_cross_encoder=True,
+                cross_encoder_fn=cross_encoder_score,
+            ),
+            q,
+        )
 
     merge_results(clean_query)
+
+    # Graph expansion: pull related chunks via Neo4j (same act/neighbor sections).
+    if os.environ.get("ENABLE_GRAPH", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            from orchestrator import get_orchestrator
+
+            acts_to_sections = {}
+            for doc in all_docs.values():
+                meta = doc.metadata or {}
+                act = (meta.get("act") or "").strip()
+                sec = (meta.get("section") or "").strip()
+                if act:
+                    acts_to_sections.setdefault(act, set())
+                    if sec:
+                        acts_to_sections[act].add(sec)
+
+            vs = vector.get_vector_store()
+            orch = get_orchestrator()
+            for act, secs in acts_to_sections.items():
+                cand_ids = orch.graph_candidates(act=act, sections=list(secs))
+                if not cand_ids:
+                    continue
+                graph_docs = vs.get_by_ids(cand_ids[:max(retrieval_k * 5, 50)])
+                for gd in graph_docs:
+                    merge_docs(gd, clean_query, score_floor=0.35)
+        except Exception:
+            pass
+
+    def _reconstruct_parent_sections(all_docs_map: dict[str, Document], selected: list[Document]) -> list[Document]:
+        """Merge sibling chunks from the same section/act/source into a parent section block."""
+        out: list[Document] = []
+        seen_keys = set()
+        for d in selected:
+            meta = d.metadata or {}
+            key = (meta.get("source_path"), meta.get("act"), meta.get("section"))
+            if key and key not in seen_keys and key[1] and key[2]:
+                siblings = [
+                    doc
+                    for doc in all_docs_map.values()
+                    if (doc.metadata or {}).get("source_path") == key[0]
+                    and (doc.metadata or {}).get("act") == key[1]
+                    and (doc.metadata or {}).get("section") == key[2]
+                ]
+                if siblings:
+                    siblings_sorted = sorted(
+                        siblings,
+                        key=lambda x: (
+                            (x.metadata or {}).get("paragraph_number")
+                            or (x.metadata or {}).get("char_count", 0)
+                        ),
+                    )
+                    text = "\n\n".join(doc.page_content for doc in siblings_sorted if doc.page_content)
+                    parent_meta = dict(meta)
+                    parent_meta["parent_reconstructed"] = True
+                    out.append(Document(page_content=text, metadata=parent_meta))
+                    seen_keys.add(key)
+                    continue
+            out.append(d)
+        return out
 
     # 4) FILTER BY RELEVANCE THRESHOLD (precision-first)
     # Clause/issue queries often use plain language, so use a slightly lower threshold.
@@ -1309,7 +1518,17 @@ def answer_query(
         # First: try to match the Act by filename (very reliable for "what is <act>" queries).
         target_source = detect_target_source_file(clean_query)
         if target_source:
-            for d in _collection_get_docs({"source": target_source}, limit=1200):
+            source_hits = source_filtered_retrieve(clean_query, target_source, k=min(max(retrieval_k, 18), 24))
+            for d in source_hits:
+                doc_id = _doc_key(d)
+                score = calculate_relevance_score(clean_query, d)
+                if doc_id not in all_docs:
+                    all_docs[doc_id] = d
+                    doc_relevance[doc_id] = score
+                else:
+                    doc_relevance[doc_id] = max(doc_relevance[doc_id], score)
+
+            for d in _fetch_overview_scope_docs({"source": target_source}, clean_query, limit=OVERVIEW_OUTLINE_DOC_LIMIT):
                 doc_id = _doc_key(d)
                 score = calculate_relevance_score(clean_query, d)
                 if doc_id not in all_docs:
@@ -1339,53 +1558,23 @@ def answer_query(
                 else:
                     doc_relevance[doc_id] = max(doc_relevance[doc_id], score)
 
-            # Also fetch an "outline" set from that Act using metadata-only access.
-            # This helps overview queries pull in definitions/scope sections that embeddings may miss.
-            docs = _collection_get_docs({"act": target_act}, limit=800)
-            if docs:
-
-                def sec_num(d: Document) -> int:
-                    s = d.metadata.get("section")
-                    try:
-                        return int(str(s).strip())
-                    except Exception:
-                        return 10**9
-
-                key_terms = [
-                    "short title", "extent", "commencement", "application",
-                    "definitions", "interpretation",
-                    "contract", "agreement", "consideration", "proposal", "acceptance",
-                    "competent", "free consent", "void", "voidable", "unlawful",
-                    "performance", "breach", "damages", "compensation", "remedy",
-                    "indemnity", "guarantee",
-                ]
-
-                def outline_score(d: Document) -> int:
-                    txt = d.page_content.lower()
-                    score = 0
-                    for kw in key_terms:
-                        if kw in txt:
-                            score += 3
-                    n = sec_num(d)
-                    if n < 20:
-                        score += 4
-                    if n < 10:
-                        score += 3
-                    return score
-
-                docs = sorted(docs, key=lambda d: (outline_score(d), -len(d.page_content)), reverse=True)[:25]
-                for d in docs:
-                    doc_id = _doc_key(d)
-                    score = calculate_relevance_score(clean_query, d)
-                    if doc_id not in all_docs:
-                        all_docs[doc_id] = d
-                        doc_relevance[doc_id] = score
-                    else:
-                        doc_relevance[doc_id] = max(doc_relevance[doc_id], score)
+            # Also fetch a compact "outline" set from that Act using targeted metadata access.
+            # This keeps overview queries holistic without pulling the whole Act into Python.
+            docs = _fetch_overview_scope_docs({"act": target_act}, clean_query, limit=OVERVIEW_OUTLINE_DOC_LIMIT)
+            for d in docs:
+                doc_id = _doc_key(d)
+                score = calculate_relevance_score(clean_query, d)
+                if doc_id not in all_docs:
+                    all_docs[doc_id] = d
+                    doc_relevance[doc_id] = score
+                else:
+                    doc_relevance[doc_id] = max(doc_relevance[doc_id], score)
 
     # Recall/rescue: plain-language legal queries often miss the exact statutory wording.
     ordered_ids = sorted(all_docs.keys(), key=lambda i: doc_relevance.get(i, 0.0), reverse=True)
     top_docs = [all_docs[i] for i in ordered_ids[:12]]
+    # Expand to parent sections where possible to give the LLM full statutory context.
+    top_docs = _reconstruct_parent_sections(all_docs, top_docs)
     base_conf = estimate_context_confidence(top_docs)
     base_statutory = sum(1 for d in top_docs if d.metadata.get("doc_type") in {"pdf", "md", "json"})
     needs_help = (base_conf < (0.50 if is_overview else 0.45)) or (base_statutory < (3 if is_overview else 2))
@@ -1501,10 +1690,8 @@ def answer_query(
                 + "\n\nNote: Citations were provided but not consistently per paragraph; please verify against the cited sources."
             )
 
-    # If the model says the answer isn't in the retrieved context, fall back to general knowledge
-    # (but label it clearly as not-from-RAG and low confidence).
     if answer.strip().startswith("Not found in retrieved sources."):
-        fb = fallback_answer(query, model)
-        return annotate_answer(fb, 0.2, "General knowledge (not from RAG)"), []
+        answer = fallback_answer(query, model)
+        return annotate_answer(answer, 0.2, "General knowledge (not from RAG)"), []
 
     return annotate_answer(answer, confidence, "Retrieved sources (RAG)"), relevant_docs[:5]
