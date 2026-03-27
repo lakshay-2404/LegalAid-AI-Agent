@@ -85,7 +85,7 @@ Notes:
 
 ## Architecture
 
-```mermaid
+```
 flowchart LR
   subgraph UI[User Interface]
     ST[Streamlit app.py]
