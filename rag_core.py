@@ -1455,38 +1455,6 @@ def answer_query(
         except Exception:
             pass
 
-    def _reconstruct_parent_sections(all_docs_map: dict[str, Document], selected: list[Document]) -> list[Document]:
-        """Merge sibling chunks from the same section/act/source into a parent section block."""
-        out: list[Document] = []
-        seen_keys = set()
-        for d in selected:
-            meta = d.metadata or {}
-            key = (meta.get("source_path"), meta.get("act"), meta.get("section"))
-            if key and key not in seen_keys and key[1] and key[2]:
-                siblings = [
-                    doc
-                    for doc in all_docs_map.values()
-                    if (doc.metadata or {}).get("source_path") == key[0]
-                    and (doc.metadata or {}).get("act") == key[1]
-                    and (doc.metadata or {}).get("section") == key[2]
-                ]
-                if siblings:
-                    siblings_sorted = sorted(
-                        siblings,
-                        key=lambda x: (
-                            (x.metadata or {}).get("paragraph_number")
-                            or (x.metadata or {}).get("char_count", 0)
-                        ),
-                    )
-                    text = "\n\n".join(doc.page_content for doc in siblings_sorted if doc.page_content)
-                    parent_meta = dict(meta)
-                    parent_meta["parent_reconstructed"] = True
-                    out.append(Document(page_content=text, metadata=parent_meta))
-                    seen_keys.add(key)
-                    continue
-            out.append(d)
-        return out
-
     # 4) FILTER BY RELEVANCE THRESHOLD (precision-first)
     # Clause/issue queries often use plain language, so use a slightly lower threshold.
     min_relevance = 0.25 if (is_overview or clause_query or issue_force) else 0.30
@@ -1574,7 +1542,7 @@ def answer_query(
     ordered_ids = sorted(all_docs.keys(), key=lambda i: doc_relevance.get(i, 0.0), reverse=True)
     top_docs = [all_docs[i] for i in ordered_ids[:12]]
     # Expand to parent sections where possible to give the LLM full statutory context.
-    top_docs = _reconstruct_parent_sections(all_docs, top_docs)
+    top_docs = reconstruct_sections(top_docs, all_docs.values())
     base_conf = estimate_context_confidence(top_docs)
     base_statutory = sum(1 for d in top_docs if d.metadata.get("doc_type") in {"pdf", "md", "json"})
     needs_help = (base_conf < (0.50 if is_overview else 0.45)) or (base_statutory < (3 if is_overview else 2))
