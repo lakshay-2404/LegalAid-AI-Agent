@@ -31,6 +31,10 @@ MAX_EMBED_CHARS = int(os.environ.get("INGEST_MAX_CHARS", "4000"))   # raised fro
 
 # Lightweight statute/section reference finder for queries
 _QUERY_SECTION_RE = re.compile(r"\b(?:section|sec|s)\.?\s*([0-9]{1,4}[A-Z]?)\b", re.IGNORECASE)
+_SECTION_HEADING_RE = re.compile(
+    r"(?:^|[\n\r]| {2,})([0-9]{1,4}[A-Z]?)(?:\s*\(([a-z0-9]+)\))?\.\s+([^\n]{3,180})",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # ---------------------------------------------------------------------------
 # Text splitters
@@ -174,27 +178,50 @@ _ACT_PATTERNS: list[tuple[str, str]] = [
 ]
 
 
+def _match_act_name(text: str) -> str | None:
+    for pattern, act_name in _ACT_PATTERNS:
+        if re.search(pattern, text or "", re.IGNORECASE):
+            return act_name
+    return None
+
+
+def _clean_section_title(value: str) -> str:
+    title = re.sub(r"\s+", " ", (value or "").strip(" .:-"))
+    if not title:
+        return ""
+    title = re.split(r"\s{2,}(?=[A-Z\"(])", title, maxsplit=1)[0]
+    return title[:180].strip()
+
+
 def extract_legal_structure(text: str) -> dict:
     """Extract act, chapter, section, subsection, clause from a text snippet."""
     meta: dict = {}
-    for pattern, act_name in _ACT_PATTERNS:
-        if re.search(pattern, text, re.IGNORECASE):
-            meta["act"] = act_name
-            break
+    act_name = _match_act_name(text)
+    if act_name:
+        meta["act"] = act_name
 
     chapter = re.search(r"Chapter\s+([IVXLC0-9]+)", text, re.IGNORECASE)
     if chapter:
         meta["chapter"] = chapter.group(1)
 
-    section = re.search(r"Section\s+([0-9]+(?:[A-Z])?)", text)
-    if section:
-        meta["section"] = section.group(1)
+    heading = _SECTION_HEADING_RE.search(text or "")
+    if heading:
+        meta["section"] = heading.group(1).upper()
+        if heading.group(2):
+            meta["subsection"] = heading.group(2)
+        title = _clean_section_title(heading.group(3) or "")
+        if title:
+            meta["section_title"] = title
+    else:
+        section = re.search(r"\bSection\s+([0-9]+(?:[A-Z])?)", text, re.IGNORECASE)
+        if section:
+            meta["section"] = section.group(1).upper()
 
-    subsection = re.search(r"Section\s+(?:[0-9]+)?\s*\(([a-z0-9]+)\)", text)
-    if subsection:
-        meta["subsection"] = subsection.group(1)
+        subsection = re.search(r"\bSection\s+(?:[0-9]+(?:[A-Z])?)?\s*\(([a-z0-9]+)\)", text, re.IGNORECASE)
+        if subsection:
+            meta["subsection"] = subsection.group(1)
 
-    clause = re.search(r"Clause\s+\(([a-z]+)\)", text)
+    clause = re.search(r"Clause\s+\(([a-z]+)\)", text, re.IGNORECASE)
     if clause:
         meta["clause"] = clause.group(1)
 
@@ -205,6 +232,32 @@ def extract_legal_structure(text: str) -> dict:
         meta["citation"] = citation
 
     return meta
+
+
+def enrich_legal_metadata(text: str, metadata: dict | None = None) -> dict:
+    enriched = dict(metadata or {})
+    inferred = extract_legal_structure(text or "")
+    source_hint = str(enriched.get("source") or enriched.get("source_path") or "")
+    source_act = _match_act_name(source_hint.replace("_", " ").replace("-", " "))
+    statute_like = str(enriched.get("doc_type") or "").lower() in {"json", "md", "pdf", "txt"}
+
+    if source_act and statute_like:
+        enriched["act"] = source_act
+        for key in ("section", "subsection", "section_title"):
+            if inferred.get(key):
+                enriched[key] = inferred[key]
+
+    for key in ("act", "chapter", "section", "subsection", "clause", "section_title"):
+        if not enriched.get(key) and inferred.get(key):
+            enriched[key] = inferred[key]
+
+    if enriched.get("act") and enriched.get("section"):
+        citation = f"{enriched['section']}, {enriched['act']}"
+        if enriched.get("subsection"):
+            citation = f"{enriched['section']}({enriched['subsection']}), {enriched['act']}"
+        enriched["citation"] = citation
+
+    return enriched
 
 
 def detect_statute_query(text: str) -> tuple[str | None, list[str]]:
@@ -237,6 +290,9 @@ def safe_rel_path(path: Path, base_dir: Path) -> str:
 
 def infer_act_from_path(path: Path) -> str:
     name = path.stem.replace("_", " ").replace("-", " ").strip()
+    canonical = _match_act_name(name)
+    if canonical:
+        return canonical
     return re.sub(r"\s+", " ", name)
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ prompt assembly for the LegalAid RAG pipeline.
 from __future__ import annotations
 
 import heapq
+import hashlib
 import logging
 import re
 import time
@@ -41,47 +42,117 @@ _bm25 = None
 _all_docs: List[Document] = []
 _doc_lookup: dict[str, Document] = {}
 _bm25_lock = threading.Lock()
+_bm25_state_token = None
+BM25_CACHE_VERSION = 2
+
+
+def _path_state_token(path) -> tuple[str, int, int]:
+    try:
+        stat = path.stat()
+        return (
+            path.name,
+            int(stat.st_size),
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+        )
+    except FileNotFoundError:
+        return (path.name, 0, 0)
+    except OSError:
+        return (path.name, -1, -1)
+
+
+def _bm25_db_state_token() -> tuple:
+    wal_path = BM25_DB_PATH.with_name(BM25_DB_PATH.name + "-wal")
+    shm_path = BM25_DB_PATH.with_name(BM25_DB_PATH.name + "-shm")
+    return (
+        _path_state_token(BM25_DB_PATH),
+        _path_state_token(wal_path),
+        _path_state_token(shm_path),
+        int(BM25_MAX_DOCS),
+    )
+
+
+def _bm25_doc_signature(docs: List[Document]) -> str:
+    sha = hashlib.sha256()
+    for doc in docs:
+        meta = doc.metadata or {}
+        sha.update(str(meta.get("doc_id") or "").encode("utf-8", errors="ignore"))
+        sha.update(b"\0")
+        sha.update((doc.page_content or "").encode("utf-8", errors="ignore"))
+        sha.update(b"\0")
+    return sha.hexdigest()
+
+
+def _load_cached_bm25(signature: str):
+    if not BM25_PICKLE_PATH.exists():
+        return None
+    try:
+        import pickle
+
+        with open(BM25_PICKLE_PATH, "rb") as f:
+            payload = pickle.load(f)
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != BM25_CACHE_VERSION:
+        return None
+    if payload.get("signature") != signature:
+        return None
+
+    cached = payload.get("bm25")
+    if cached is None or not hasattr(cached, "get_scores"):
+        return None
+    return cached
+
+
+def _save_cached_bm25(bm25, signature: str) -> None:
+    try:
+        import pickle
+
+        BM25_PICKLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(BM25_PICKLE_PATH, "wb") as f:
+            pickle.dump(
+                {
+                    "version": BM25_CACHE_VERSION,
+                    "signature": signature,
+                    "bm25": bm25,
+                },
+                f,
+            )
+    except Exception:
+        pass
 
 
 def ensure_bm25() -> None:
-    global _bm25, _all_docs, _doc_lookup
-    if _bm25 is not None:
+    global _bm25, _all_docs, _doc_lookup, _bm25_state_token
+    state_token = _bm25_db_state_token()
+    if _bm25 is not None and _bm25_state_token == state_token:
         return
     with _bm25_lock:
-        if _bm25 is not None:
+        state_token = _bm25_db_state_token()
+        if _bm25 is not None and _bm25_state_token == state_token:
             return
 
         _bm25_db_init()
         from ingestion import _bm25_db_load_docs
         _all_docs = _bm25_db_load_docs()
         _doc_lookup.clear()
+        _bm25_state_token = _bm25_db_state_token()
 
         if not _all_docs:
             _bm25 = None
             return
 
-        # Try cached pickle first.
-        try:
-            if BM25_PICKLE_PATH.exists():
-                import pickle
-                with open(BM25_PICKLE_PATH, "rb") as f:
-                    cached = pickle.load(f)
-                if hasattr(cached, "corpus_size") and cached.corpus_size == len(_all_docs):
-                    _bm25 = cached
-                    return
-        except Exception:
-            pass
+        corpus_signature = _bm25_doc_signature(_all_docs)
+        cached = _load_cached_bm25(corpus_signature)
+        if cached is not None:
+            _bm25 = cached
+            return
 
         from rank_bm25 import BM25Okapi  # type: ignore
         _bm25 = BM25Okapi([doc.page_content.split() for doc in _all_docs])
-
-        try:
-            import pickle
-            BM25_PICKLE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(BM25_PICKLE_PATH, "wb") as f:
-                pickle.dump(_bm25, f)
-        except Exception:
-            pass
+        _save_cached_bm25(_bm25, corpus_signature)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +279,33 @@ def _doc_key(doc: Document) -> str:
     return doc.metadata.get("doc_id") or str(id(doc))
 
 
+def _graph_candidate_score(
+    doc: Document,
+    *,
+    query_terms: List[str],
+    act_hint: Optional[str],
+    section_hints: List[str],
+) -> float:
+    meta = doc.metadata or {}
+    act = str(meta.get("act") or "").lower()
+    sec = str(meta.get("section") or "").upper()
+    score = 0.35
+
+    if act_hint and act_hint.lower() in act:
+        score += 0.20
+    if section_hints and sec and sec in {s.upper() for s in section_hints if s}:
+        score += 0.15
+    if meta.get("doc_type") in {"pdf", "md", "json", "statute"}:
+        score += 0.05
+
+    if query_terms:
+        text = doc.page_content.lower()
+        matched = sum(1 for term in query_terms if term in text)
+        score += min(matched / max(1, len(query_terms)), 1.0) * 0.15
+
+    return score
+
+
 def hybrid_retrieve(
     query: str,
     k: int = 10,
@@ -279,6 +377,7 @@ def hybrid_retrieve(
     merged_ids = set(vector_docs) | set(bm25_docs)
     scores_combined: dict[str, float] = {}
     merged: dict[str, Document] = {}
+    section_hint_set = {s.upper() for s in section_hints if s}
 
     for doc_id in merged_ids:
         combined = (vector_scores.get(doc_id, 0.0) * 0.6) + (bm25_scores.get(doc_id, 0.0) * 0.4)
@@ -289,14 +388,45 @@ def hybrid_retrieve(
             sec = str(meta.get("section") or "").upper()
             if act_hint and act_hint.lower() in act:
                 combined += 0.2
-            if section_hints and sec and sec in {s.upper() for s in section_hints}:
-                combined += 0.1
+            if section_hint_set:
+                if sec and sec in section_hint_set:
+                    combined += 0.25
+                elif not sec:
+                    combined -= 0.15
             if meta.get("doc_type") == "statute":
                 combined += 0.05
         merged[doc_id] = doc
         scores_combined[doc_id] = combined
 
     ordered_docs = [doc for _, doc in sorted(merged.items(), key=lambda x: scores_combined[x[0]], reverse=True)]
+    query_terms = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if len(t) > 2]
+
+    if graph_expand and _graph_enabled():
+        try:
+            candidate_pool = ordered_docs[: max(fetch_k, k, 30)]
+            expanded_docs = _graph_expand_docs(
+                candidate_pool,
+                act_hint,
+                section_hints,
+                limit=max(fetch_k, k, 80),
+            )
+            if expanded_docs:
+                for doc in expanded_docs:
+                    doc_id = _doc_key(doc)
+                    graph_score = _graph_candidate_score(
+                        doc,
+                        query_terms=query_terms,
+                        act_hint=act_hint,
+                        section_hints=section_hints,
+                    )
+                    if doc_id not in merged:
+                        merged[doc_id] = doc
+                        scores_combined[doc_id] = graph_score
+                    else:
+                        scores_combined[doc_id] = max(scores_combined[doc_id], graph_score)
+                ordered_docs = [doc for _, doc in sorted(merged.items(), key=lambda x: scores_combined[x[0]], reverse=True)]
+        except Exception as e:
+            logger.warning("Graph expand skipped: %s", e)
 
     if use_mmr and ordered_docs:
         try:
@@ -323,11 +453,19 @@ def hybrid_retrieve(
             print(f"Warning: cross-encoder rerank skipped: {e}")
             ordered_docs = ordered_docs[:k]
 
-    if graph_expand and _graph_enabled():
-        try:
-            ordered_docs = _graph_expand_docs(ordered_docs[: max(fetch_k, k, 30)], act_hint, section_hints, limit=max(fetch_k, k, 80))
-        except Exception as e:
-            logger.warning("Graph expand skipped: %s", e)
+    if section_hint_set and ordered_docs:
+        exact_section_docs = []
+        other_section_docs = []
+        unsectioned_docs = []
+        for doc in ordered_docs:
+            sec = str((doc.metadata or {}).get("section") or "").upper()
+            if sec in section_hint_set:
+                exact_section_docs.append(doc)
+            elif sec:
+                other_section_docs.append(doc)
+            else:
+                unsectioned_docs.append(doc)
+        ordered_docs = exact_section_docs + other_section_docs + unsectioned_docs
 
     return ordered_docs[:k]
 

@@ -25,6 +25,7 @@ from langchain_core.documents import Document
 import embeddings as emb
 from chunking import (
     MAX_EMBED_CHARS,
+    enrich_legal_metadata,
     iter_json_docs_from_path,
     iter_md_docs,
     iter_pdf_docs,
@@ -377,6 +378,7 @@ def _bm25_db_load_docs() -> List[Document]:
                 except Exception:
                     meta = {}
                 meta.setdefault("doc_id", doc_id)
+                meta = enrich_legal_metadata(text or "", meta)
                 out.append(Document(page_content=text or "", metadata=meta))
             return out
     except Exception as e:

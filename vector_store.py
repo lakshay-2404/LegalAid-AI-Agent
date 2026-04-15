@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal
 
 from langchain_core.documents import Document
+from chunking import enrich_legal_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -496,7 +497,11 @@ class MilvusVectorStore:
                 meta["doc_id"] = getattr(ent, "doc_id")
             except Exception:
                 pass
-        return meta
+        try:
+            text = str(getattr(ent, "text", "") or "")
+        except Exception:
+            text = ""
+        return enrich_legal_metadata(text, meta)
 
     def _metadata_from_row(self, row: dict[str, Any]) -> dict[str, Any]:
         meta: dict[str, Any] = {}
@@ -522,7 +527,7 @@ class MilvusVectorStore:
                 meta.update(json.loads(meta_json))
             except Exception:
                 pass
-        return meta
+        return enrich_legal_metadata(str(row.get("text") or ""), meta)
 
 
 def infer_embedding_dim(embed_query: Callable[[str], list[float]]) -> int:
